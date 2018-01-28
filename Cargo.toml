@@ -11,7 +11,7 @@
 # will likely look very different (and much more reasonable)
 
 [package]
-name = "cortex-m-quickstart"
+name = "demo"
 version = "0.2.4"
 authors = ["Jorge Aparicio <jorge@japaric.io>"]
 description = "A template for building applications for ARM Cortex-M microcontrollers"
@@ -26,6 +26,12 @@ incremental = false
 [profile.release]
 lto = true
 debug = true
+
+[dependencies]
+# tm4c123x = "*"
+tm4c123x = { path = "../dslite2svd/crates/tm4c123x" }
+tm4c123x-hal = { path = "../tm4c123x-hal" }
+
 [dependencies.cortex-m]
 version = "0.3.0"
 
