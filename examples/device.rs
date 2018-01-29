@@ -41,8 +41,7 @@ use cortex_m::peripheral::SystClkSource;
 use cortex_m_semihosting::hio::{self, HStdout};
 use stm32f103xx::Interrupt;
 
-static HSTDOUT: Mutex<RefCell<Option<HStdout>>> =
-    Mutex::new(RefCell::new(None));
+static HSTDOUT: Mutex<RefCell<Option<HStdout>>> = Mutex::new(RefCell::new(None));
 
 fn main() {
     interrupt::free(|cs| {

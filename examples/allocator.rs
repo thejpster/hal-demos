@@ -25,7 +25,6 @@
 //!
 //! ---
 
-#[allow(deprecated)]
 #![feature(collections)]
 #![feature(used)]
 #![no_std]

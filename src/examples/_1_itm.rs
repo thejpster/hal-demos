@@ -14,29 +14,29 @@
 //! ---
 //!
 //! ```
-//! 
+//!
 //! #![feature(used)]
 //! #![no_std]
-//! 
+//!
 //! #[macro_use]
 //! extern crate cortex_m;
 //! extern crate cortex_m_rt;
-//! 
+//!
 //! use cortex_m::{asm, interrupt, peripheral};
-//! 
+//!
 //! fn main() {
 //!     interrupt::free(|cs| {
 //!         let itm = peripheral::ITM.borrow(&cs);
-//! 
+//!
 //!         iprintln!(&itm.stim[0], "Hello, world!");
 //!     });
 //! }
-//! 
+//!
 //! // As we are not using interrupts, we just register a dummy catch all handler
 //! #[link_section = ".vector_table.interrupts"]
 //! #[used]
 //! static INTERRUPTS: [extern "C" fn(); 240] = [default_handler; 240];
-//! 
+//!
 //! extern "C" fn default_handler() {
 //!     asm::bkpt();
 //! }
