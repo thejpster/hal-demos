@@ -28,8 +28,6 @@ lto = true
 debug = true
 
 [dependencies]
-# tm4c123x = "*"
-tm4c123x = { path = "../dslite2svd/crates/tm4c123x" }
 tm4c123x-hal = { path = "../tm4c123x-hal" }
 
 [dependencies.cortex-m]
