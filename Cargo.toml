@@ -29,6 +29,7 @@ debug = true
 
 [dependencies]
 tm4c123x-hal = { path = "../tm4c123x-hal" }
+embedded-hal = "0.1.0"
 
 [dependencies.cortex-m]
 version = "0.3.0"

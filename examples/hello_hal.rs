@@ -9,6 +9,7 @@ extern crate cortex_m;
 extern crate cortex_m_rt;
 extern crate cortex_m_semihosting;
 extern crate tm4c123x_hal;
+extern crate embedded_hal;
 
 use core::fmt::Write;
 
@@ -16,6 +17,8 @@ use cortex_m::asm;
 use cortex_m_semihosting::hio;
 
 use tm4c123x_hal::sysctl::{self, chip_id, SysctlExt};
+use tm4c123x_hal::gpio::GpioExt;
+use embedded_hal::digital::OutputPin;
 
 fn main() {
     let mut stdout = hio::hstdout().unwrap();
@@ -42,6 +45,9 @@ fn main() {
     );
 
     // turn on LED here
+    let port = p.GPIO_PORTF.split(&sc.power_control);
+    let mut pf1 = port.pf1.into_push_pull_output();
+    pf1.set_high();
 
     writeln!(stdout, "Chip: {:?}", chip_id::get()).unwrap();
 }
