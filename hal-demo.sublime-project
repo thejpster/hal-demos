@@ -1,0 +1,27 @@
+{
+	"folders":
+	[
+		{
+			"path": "/home/jonathan/Documents/programming/tm4c123x-hal"
+		},
+		{
+			"path": "/home/jonathan/Documents/programming/embedded-hal"
+		},
+		{
+			"path": "."
+		}
+	],
+	"build_systems":
+	[
+		{
+			"name": "xargo release",
+			"cmd": [ "xargo", "build", "--release", "--example", "hello_hal"],
+			"working_dir": "${project_path:${folder}}",
+		},
+		{
+			"name": "xargo debug",
+			"cmd": [ "xargo", "build", "--example", "hello_hal"],
+			"working_dir": "${project_path:${folder}}",
+		}
+	]
+}
