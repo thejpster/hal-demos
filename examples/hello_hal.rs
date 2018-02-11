@@ -8,15 +8,15 @@
 extern crate cortex_m;
 extern crate cortex_m_rt;
 extern crate cortex_m_semihosting;
-extern crate tm4c123x_hal;
 extern crate embedded_hal;
+extern crate tm4c123x_hal;
 
 use core::fmt::Write;
 use cortex_m::asm;
 use cortex_m_semihosting::hio;
 use embedded_hal::prelude::*;
 use tm4c123x_hal::gpio::GpioExt;
-use tm4c123x_hal::serial::{Serial, NewlineMode};
+use tm4c123x_hal::serial::{NewlineMode, Serial};
 use tm4c123x_hal::sysctl::{self, chip_id, SysctlExt};
 use tm4c123x_hal::time::U32Ext;
 use tm4c123x_hal::delay::Delay;
@@ -55,7 +55,7 @@ fn main() {
         115200_u32.bps(),
         NewlineMode::SwapLFtoCRLF,
         &clocks,
-        &sc.power_control
+        &sc.power_control,
     );
     // Print chip info
     let (mut tx, mut rx) = uart.split();
@@ -74,7 +74,7 @@ fn main() {
         115200_u32.bps(),
         NewlineMode::SwapLFtoCRLF,
         &clocks,
-        &sc.power_control
+        &sc.power_control,
     );
 
     // turn on LED here
