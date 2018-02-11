@@ -19,72 +19,94 @@ use tm4c123x_hal::gpio::GpioExt;
 use tm4c123x_hal::serial::{Serial, NewlineMode};
 use tm4c123x_hal::sysctl::{self, chip_id, SysctlExt};
 use tm4c123x_hal::time::U32Ext;
+use tm4c123x_hal::delay::Delay;
 
 fn main() {
-    let mut stdout = hio::hstdout().unwrap();
-    writeln!(stdout, "Hello, world!").unwrap();
+    let mut itm = hio::hstdout().unwrap();
+    writeln!(itm, "Hello, world!").unwrap();
 
     let p = tm4c123x_hal::Peripherals::take().unwrap();
+    let core_p = tm4c123x_hal::CorePeripherals::take().unwrap();
     let mut sc = p.SYSCTL.constrain();
+
+    // This will run you at 8MHz using the internal oscillator
     // sc.clock_setup.oscillator = sysctl::Oscillator::Main(
     //     sysctl::CrystalFrequency::_16mhz,
     //     sysctl::SystemClock::UseOscillator(sysctl::Divider::_2),
     // );
+
+    // This runs you at 66.67MHz using the 16MHz crystal and the PLL
     sc.clock_setup.oscillator = sysctl::Oscillator::Main(
         sysctl::CrystalFrequency::_16mhz,
-        sysctl::SystemClock::UsePll(sysctl::PllOutputFrequency::_66_67mhz),
-    );
-    writeln!(stdout, "Freezing clocks...").unwrap();
-    let clocks = sc.clock_setup.freeze();
-    writeln!(stdout, "Sysclk: {} Hz", clocks.sysclk.0).unwrap();
-    sysctl::control_power(
-        &sc.power_control,
-        sysctl::PeripheralPowerDomain::GpioA,
-        sysctl::RunMode::Run,
-        sysctl::PowerState::On,
+        sysctl::SystemClock::UsePll(sysctl::PllOutputFrequency::_80_00mhz),
     );
 
-    // Print chip info
-    writeln!(stdout, "Chip: {:?}", chip_id::get()).unwrap();
+    let clocks = sc.clock_setup.freeze();
+    let mut porta = p.GPIO_PORTA.split(&sc.power_control);
+    let mut portf = p.GPIO_PORTF.split(&sc.power_control);
 
     // Activate UART
-    let mut porta = p.GPIO_PORTA.split(&sc.power_control);
-    let rx_pin = porta.pa0.into_af1(&mut porta.control);
-    let tx_pin = porta.pa1.into_af1(&mut porta.control);
-    let mut uart = Serial::uart0(
+    let uart = Serial::uart0(
         p.UART0,
-        tx_pin,
-        rx_pin,
+        porta.pa1.into_af1(&mut porta.control),
+        porta.pa0.into_af1(&mut porta.control),
+        (),
+        (),
         115200_u32.bps(),
         NewlineMode::SwapLFtoCRLF,
         &clocks,
         &sc.power_control
     );
-    writeln!(uart, "Hello from Serial()").unwrap();
-    let (mut tx, _rx) = uart.split();
+    // Print chip info
+    let (mut tx, mut rx) = uart.split();
+    writeln!(tx, "Chip: {:?}", chip_id::get()).unwrap();
+
+    // This will activate UART1 with H/W flow control
+    // TODO: Test with FTDI TTL USB cable.
+    let mut portb = p.GPIO_PORTB.split(&sc.power_control);
+    let mut portc = p.GPIO_PORTC.split(&sc.power_control);
+    let _uart1 = Serial::uart1(
+        p.UART1,
+        portb.pb1.into_af1(&mut portb.control),
+        portb.pb0.into_af1(&mut portb.control),
+        portc.pc4.into_af8(&mut portc.control),
+        portc.pc5.into_af8(&mut portc.control),
+        115200_u32.bps(),
+        NewlineMode::SwapLFtoCRLF,
+        &clocks,
+        &sc.power_control
+    );
 
     // turn on LED here
-    let portf = p.GPIO_PORTF.split(&sc.power_control);
     let mut led_red = portf.pf1.into_push_pull_output();
     let mut led_blue = portf.pf2.into_push_pull_output();
     let mut led_green = portf.pf3.into_push_pull_output();
-    led_red.set_high();
+    led_red.set_low();
     led_blue.set_low();
     led_green.set_low();
-    // let button_one = portf.pf0.into_pull_up_input();
-    let button_two = portf.pf4.into_pull_up_input();
+    let _sw1 = portf.pf4.into_pull_up_input();
+    let sw2 = portf.pf0.unlock(&mut portf.control).into_pull_up_input();
 
-    let mut count = 0u16;
+    let mut d = Delay::new(core_p.SYST, &clocks);
+
     loop {
-        writeln!(tx, "Hello from TX: {}\n", count).unwrap();
-        count = count.wrapping_add(1);
-        if button_two.is_low() {
+        if sw2.is_low() {
             led_blue.set_high();
             led_green.set_low();
         } else {
             led_blue.set_low();
             led_green.set_high();
         }
+        if let Ok(ch) = rx.read() {
+            writeln!(tx, "Read 0x{:02x} from the UART", ch).unwrap();
+        }
+
+        if led_red.is_high() {
+            led_red.set_low();
+        } else {
+            led_red.set_high();
+        }
+        d.delay_ms(1000u32);
     }
 }
 
