@@ -19,3 +19,4 @@ monitor arm semihosting enable
 
 load
 step
+continue
