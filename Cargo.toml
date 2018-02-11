@@ -29,7 +29,10 @@ debug = true
 
 [dependencies]
 tm4c123x-hal = { path = "../tm4c123x-hal" }
-embedded-hal = { git = "https://github.com/thejpster/embedded-hal", branch = "input_pin" }
+
+[dependencies.embedded-hal]
+version = "0.1.1"
+features = ["unproven"]
 
 [dependencies.cortex-m]
 version = "0.3.0"
