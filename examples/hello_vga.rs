@@ -42,7 +42,7 @@ fn main() {
     // let mut h_timer = portb.pb7.into_af7(&mut portb.control);
     // let mut red_data = portb.pb2.into_push_pull_output();
     // let mut blue_data = portb.pb2.into_push_pull_output();
-    let mut green_data = portb.pb7.info_af2(&mut portb.control); // Ssi2Tx
+    let mut green_data = portb.pb7.into_af2(&mut portb.control); // Ssi2Tx
 
     // Need to configure SSI2 at 20 MHz
 
