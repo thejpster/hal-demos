@@ -306,15 +306,9 @@ extern "C" fn timer0b_isr() {
 }
 
 extern "C" fn default_handler() {
-    let cp = unsafe { tm4c123x_hal::CorePeripherals::steal() };
-    let mut interrupts: [u32; 16] = [0u32; 16];
-    for (i, val) in interrupts.iter_mut().enumerate() {
-        *val = cp.NVIC.iabr[i].read();
-    }
     asm::bkpt();
 }
 
-// As we are not using interrupts, we just register a dummy catch all handler
 #[link_section = ".vector_table.interrupts"]
 #[used]
 static INTERRUPTS: [Option<extern "C" fn()>; 139] = [
