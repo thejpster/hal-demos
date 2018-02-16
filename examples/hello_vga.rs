@@ -63,7 +63,7 @@ const V_BACK_PORCH: u32 = 23;
 
 // Values for the timing system
 const V_WHOLE_FRAME: u32 = (V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
-const V_SYNC_END: u32 =  (V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
+const V_SYNC_END: u32 = (V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
 
 #[repr(align(1024))]
 struct DmaInfo {
@@ -74,7 +74,8 @@ struct DmaInfo {
 #[used]
 static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
 /// Mono framebuffer, arranged in lines.
-static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = [[0u16; 25]; VISIBLE_LINES];
+static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = include!("rust_logo.inc");
+
 /// Number of lines in frame buffer
 const VISIBLE_LINES: usize = 300;
 /// 0 .. V_WHOLE_FRAME
@@ -94,33 +95,33 @@ fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
     let cp = tm4c123x_hal::CorePeripherals::take().unwrap();
 
-    unsafe {
-        for (line_number, line_data) in FRAMEBUFFER.iter_mut().enumerate() {
-            if line_number < 100 {
-                line_data[0] = 0xFFFF;
-            } else if line_number > 200 {
-                line_data[0] = 0xFFFF;
-            } else {
-                line_data[1] = 0xAAAA;
-            }
-        }
-        FRAMEBUFFER[  0][4] = 0b0000000000000000;
-        FRAMEBUFFER[  1][4] = 0b0000000000000000;
-        FRAMEBUFFER[  2][4] = 0b0000000000000000;
-        FRAMEBUFFER[  3][4] = 0b0001000000010000;
-        FRAMEBUFFER[  4][4] = 0b0011100000111000;
-        FRAMEBUFFER[  5][4] = 0b0110110001101100;
-        FRAMEBUFFER[  6][4] = 0b1100011011000110;
-        FRAMEBUFFER[  7][4] = 0b1100011011000110;
-        FRAMEBUFFER[  8][4] = 0b1111111011111110;
-        FRAMEBUFFER[  9][4] = 0b1100011011000110;
-        FRAMEBUFFER[ 10][4] = 0b1100011011000110;
-        FRAMEBUFFER[ 11][4] = 0b1100011011000110;
-        FRAMEBUFFER[ 12][4] = 0b1100011011000110;
-        FRAMEBUFFER[ 13][4] = 0b0000000000000000;
-        FRAMEBUFFER[ 14][4] = 0b0000000000000000;
-        FRAMEBUFFER[ 15][4] = 0b0000000000000000;
-    }
+    // unsafe {
+    //     for (line_number, line_data) in FRAMEBUFFER.iter_mut().enumerate() {
+    //         if line_number < 100 {
+    //             line_data[0] = 0xFFFF;
+    //         } else if line_number > 200 {
+    //             line_data[0] = 0xFFFF;
+    //         } else {
+    //             line_data[1] = 0xAAAA;
+    //         }
+    //     }
+    //     FRAMEBUFFER[  0][4] = 0b0000000000000000;
+    //     FRAMEBUFFER[  1][4] = 0b0000000000000000;
+    //     FRAMEBUFFER[  2][4] = 0b0000000000000000;
+    //     FRAMEBUFFER[  3][4] = 0b0001000000010000;
+    //     FRAMEBUFFER[  4][4] = 0b0011100000111000;
+    //     FRAMEBUFFER[  5][4] = 0b0110110001101100;
+    //     FRAMEBUFFER[  6][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[  7][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[  8][4] = 0b1111111011111110;
+    //     FRAMEBUFFER[  9][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[ 10][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[ 11][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[ 12][4] = 0b1100011011000110;
+    //     FRAMEBUFFER[ 13][4] = 0b0000000000000000;
+    //     FRAMEBUFFER[ 14][4] = 0b0000000000000000;
+    //     FRAMEBUFFER[ 15][4] = 0b0000000000000000;
+    // }
 
     let mut sc = p.SYSCTL.constrain();
     sc.clock_setup.oscillator = sysctl::Oscillator::Main(
@@ -161,7 +162,7 @@ fn main() {
         w.dss()._16();
         w.frf().moto();
         w.spo().clear_bit();
-        w.sph().clear_bit();
+        w.sph().set_bit();
         w
     });
     // Enable TX DMA
@@ -290,19 +291,18 @@ extern "C" fn timer0a_isr() {
 }
 
 extern "C" fn timer0b_isr() {
-    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
-    if unsafe { IS_VISIBLE } {
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][0]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][1]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][2]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][3]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][4]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][5]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][6]) });
-        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][7]) });
-        // Todo write out rest of data when FIFO empty...
+    unsafe {
+        let p = tm4c123x_hal::Peripherals::steal();
+        if IS_VISIBLE {
+            for word in FRAMEBUFFER[FB_LINE as usize].iter() {
+                p.SSI2.dr.write(|w| w.data().bits(*word));
+                while p.SSI2.sr.read().tnf().bit_is_clear() {
+                    asm::nop();
+                }
+            }
+        }
+        p.TIMER0.icr.write(|w| w.cbecint().set_bit());
     }
-    p.TIMER0.icr.write(|w| w.cbecint().set_bit());
 }
 
 extern "C" fn default_handler() {
