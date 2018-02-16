@@ -15,12 +15,17 @@
 	[
 		{
 			"name": "xargo release",
-			"cmd": [ "xargo", "build", "--release", "--example", "hello_hal"],
+			"cmd": [ "xargo", "build", "--release", "--example", "hello_vga"],
+			"working_dir": "${project_path:${folder}}",
+		},
+		{
+			"name": "xargo check",
+			"cmd": [ "xargo", "check", "--example", "hello_vga"],
 			"working_dir": "${project_path:${folder}}",
 		},
 		{
 			"name": "xargo debug",
-			"cmd": [ "xargo", "build", "--example", "hello_hal"],
+			"cmd": [ "xargo", "build", "--example", "hello_vga"],
 			"working_dir": "${project_path:${folder}}",
 		}
 	]
