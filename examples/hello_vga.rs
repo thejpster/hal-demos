@@ -1,6 +1,30 @@
-//! Prints "Hello, world!" on the OpenOCD console using semihosting
+//! Emits 800 x 600 @ 60Hz VGA in mono.
 //!
-//! ---
+//! HSYNC is PB6
+//! VSYNC is PC4
+//! Analog Green is PB7 (you will need a buffer/level convertor to drop 3.3V to 0.7V, ideally with 75R source impedance)
+//!
+//! The row timing assumes 40 MHz but we're at 80 MHz so we'll need to double
+//! everything given in the timing specifications. The column timing is in
+//! lines.
+//!
+//! ```
+//! Column timing on Timer0:
+//! +----+
+//! |SYNC|BP                            FP
+//! +    +--------------------------------
+//! --------||||||||||||||||||||||||||||--
+//!
+//! Row timing on WTimer0:
+//! +----+
+//! |SYNC|BP                            FP
+//! +    +--------------------------------
+//! --------||||||||||||||||||||||||||||--
+//! ```
+//!
+//! We use PWM output from Timer0A to drive the horizontal sync pulse. We use Timer0B also in PWM mode to interrupt when
+//! the SYNC + BP (back porch) period is over; i.e when it's time to start clocking out 400 pixels at 20MHz. To do that, we
+//! use SSI2 (an SPI peripheral).
 
 #![feature(used)]
 #![no_std]
@@ -11,39 +35,54 @@ extern crate cortex_m_semihosting;
 extern crate embedded_hal;
 extern crate tm4c123x_hal;
 
-use core::fmt::Write;
 use cortex_m::asm;
-use cortex_m_semihosting::hio;
-use embedded_hal::prelude::*;
-use tm4c123x_hal::delay::Delay;
 use tm4c123x_hal::gpio::GpioExt;
 use tm4c123x_hal::sysctl::{self, SysctlExt};
 
-// This timing assumes 40 MHz but we're at 80 MHz so we'll need to double everything
-const H_VISIBLE_AREA: u32 = 80 * 20;
+const H_VISIBLE_AREA: u32 = 800 * 2;
 const H_FRONT_PORCH: u32 = 40 * 2;
-const H_SYNC_PULSE: u32 = 12 * 28;
+const H_SYNC_PULSE: u32 = 128 * 2;
 const H_BACK_PORCH: u32 = 88 * 2;
 const H_WHOLE_LINE: u32 = H_VISIBLE_AREA + H_FRONT_PORCH + H_SYNC_PULSE + H_BACK_PORCH;
 const H_SYNC_END: u32 = H_WHOLE_LINE - H_SYNC_PULSE;
 const H_LINE_START: u32 = H_WHOLE_LINE - (H_SYNC_PULSE + H_BACK_PORCH);
-// This timing is in lines, so it's fine as-is.
 const V_VISIBLE_AREA: u32 = 600;
 const V_FRONT_PORCH: u32 = 1;
 const V_SYNC_PULSE: u32 = 4;
 const V_BACK_PORCH: u32 = 23;
-const V_WHOLE_FRAME: u32 = V_VISIBLE_AREA + V_FRONT_PORCH + V_SYNC_PULSE + V_BACK_PORCH;
-const V_SYNC_END: u32 = V_WHOLE_FRAME - V_SYNC_PULSE;
-// const V_FIRST_LINE: u32 = V_WHOLE_FRAME - (V_SYNC_PULSE + V_BACK_PORCH);
+// Counting down, the sync starts at V_WHOLE_FRAME
+// Then we have the sync pulse, which ends at V_SYNC_END.
+// Then we have the back porch which ends at V_FIRST_LINE
+// Then the data
+// The the front porch ahead of the next sync
+//
+// +----+
+// |SYNC|BP                            FP
+// +    +--------------------------------
+// --------|||||||||||||||||||||||||||--
+
+// Values for the timing system
+const V_WHOLE_FRAME: u32 = (V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
+const V_SYNC_END: u32 =  (V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
 
 #[repr(align(1024))]
 struct DmaInfo {
     _data: [u8; 1024],
 }
 
-#[used]
 /// Required by the DMA engine
+#[used]
 static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
+/// Mono framebuffer, arranged in lines.
+static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = [[0u16; 25]; VISIBLE_LINES];
+/// Number of lines in frame buffer
+const VISIBLE_LINES: usize = 300;
+/// 0 .. V_WHOLE_FRAME
+static mut LINE_NUMBER: u32 = 0;
+/// true if visible, false in blanking interval
+static mut IS_VISIBLE: bool = false;
+/// 0 .. VISIBLE_LINES
+static mut FB_LINE: u32 = 0;
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
     sysctl::control_power(sc, p, sysctl::RunMode::Run, sysctl::PowerState::On);
@@ -54,30 +93,44 @@ fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
 fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
     let cp = tm4c123x_hal::CorePeripherals::take().unwrap();
-    let mut sc = p.SYSCTL.constrain();
 
     unsafe {
-        cortex_m::interrupt::enable();
+        for (line_number, line_data) in FRAMEBUFFER.iter_mut().enumerate() {
+            if line_number < 100 {
+                line_data[0] = 0xFFFF;
+            } else if line_number > 200 {
+                line_data[0] = 0xFFFF;
+            } else {
+                line_data[1] = 0xAAAA;
+            }
+        }
+        FRAMEBUFFER[  0][4] = 0b0000000000000000;
+        FRAMEBUFFER[  1][4] = 0b0000000000000000;
+        FRAMEBUFFER[  2][4] = 0b0000000000000000;
+        FRAMEBUFFER[  3][4] = 0b0001000000010000;
+        FRAMEBUFFER[  4][4] = 0b0011100000111000;
+        FRAMEBUFFER[  5][4] = 0b0110110001101100;
+        FRAMEBUFFER[  6][4] = 0b1100011011000110;
+        FRAMEBUFFER[  7][4] = 0b1100011011000110;
+        FRAMEBUFFER[  8][4] = 0b1111111011111110;
+        FRAMEBUFFER[  9][4] = 0b1100011011000110;
+        FRAMEBUFFER[ 10][4] = 0b1100011011000110;
+        FRAMEBUFFER[ 11][4] = 0b1100011011000110;
+        FRAMEBUFFER[ 12][4] = 0b1100011011000110;
+        FRAMEBUFFER[ 13][4] = 0b0000000000000000;
+        FRAMEBUFFER[ 14][4] = 0b0000000000000000;
+        FRAMEBUFFER[ 15][4] = 0b0000000000000000;
     }
 
-    // 400 bits of framebuffer
-    let mut framebuffer: [u16; 25] = [0u16; 25];
-    // light up the left edge
-    framebuffer[0] = 0x8000;
-    // light up the right edge
-    framebuffer[24] = 0x0001;
-    // fat vertical stripe
-    framebuffer[10] = 0xFFFF;
-    framebuffer[11] = 0x00FF;
-    framebuffer[12] = 0x000F;
-
+    let mut sc = p.SYSCTL.constrain();
     sc.clock_setup.oscillator = sysctl::Oscillator::Main(
         sysctl::CrystalFrequency::_16mhz,
         sysctl::SystemClock::UsePll(sysctl::PllOutputFrequency::_80_00mhz),
     );
-    let clocks = sc.clock_setup.freeze();
+    let _clocks = sc.clock_setup.freeze();
 
     let mut nvic = cp.NVIC;
+    nvic.enable(tm4c123x_hal::Interrupt::TIMER0A);
     nvic.enable(tm4c123x_hal::Interrupt::TIMER0B);
 
     enable(sysctl::Domain::Timer0, &mut sc.power_control);
@@ -97,15 +150,14 @@ fn main() {
     let _green_data = portb.pb7.into_af2(&mut portb.control);
 
     // Need to configure SSI2 at 20 MHz
-    let ssi2 = p.SSI2;
-    ssi2.cr1.modify(|_, w| w.sse().clear_bit());
+    p.SSI2.cr1.modify(|_, w| w.sse().clear_bit());
     // SSIClk = SysClk / (CPSDVSR * (1 + SCR))
     // 20 MHz = 80 MHz / (4 * (1 + 0))
     // SCR = 0
     // CPSDVSR = 4
-    ssi2.cpsr.write(|w| unsafe { w.cpsdvsr().bits(4) });
+    p.SSI2.cpsr.write(|w| unsafe { w.cpsdvsr().bits(4) });
     // Send 16 bits at a time in Freescale format
-    ssi2.cr0.write(|w| {
+    p.SSI2.cr0.write(|w| {
         w.dss()._16();
         w.frf().moto();
         w.spo().clear_bit();
@@ -113,11 +165,11 @@ fn main() {
         w
     });
     // Enable TX DMA
-    // ssi2.dmactl.write(|w| w.txdmae().set_bit());
+    // p.SSI2.dmactl.write(|w| w.txdmae().set_bit());
     // Set clock source to sysclk
-    ssi2.cc.modify(|_, w| w.cs().syspll());
+    p.SSI2.cc.modify(|_, w| w.cs().syspll());
     // Enable SSI2
-    ssi2.cr1.modify(|_, w| w.sse().set_bit());
+    p.SSI2.cr1.modify(|_, w| w.sse().set_bit());
 
     // Need to configure MicroDMA to feed SSI2 with data
     // That's Encoder 2, Channel 13
@@ -135,6 +187,7 @@ fn main() {
     h_timer.tamr.modify(|_, w| {
         w.taams().set_bit();
         w.tacmr().clear_bit();
+        w.tapwmie().set_bit();
         w.tamr().period();
         w
     });
@@ -142,13 +195,17 @@ fn main() {
         w.tbams().set_bit();
         w.tbcmr().clear_bit();
         w.tbmr().period();
-        w.tbmie().set_bit();
         w.tbpwmie().set_bit();
         w
     });
     h_timer.ctl.modify(|_, w| w.tapwml().clear_bit());
-    // Trigger Timer B capture on falling edge (i.e. line start)
-    h_timer.ctl.modify(|_, w| w.tbpwml().set_bit());
+    h_timer.ctl.modify(|_, w| {
+        // Trigger Timer A capture on rising edge (i.e. line start)
+        w.tapwml().clear_bit();
+        // Trigger Timer B capture on falling edge (i.e. data start)
+        w.tbpwml().set_bit();
+        w
+    });
     h_timer.tapr.modify(|_, w| unsafe { w.bits(0) });
     h_timer.tbpr.modify(|_, w| unsafe { w.bits(0) });
     // We're counting down in PWM mode, so start at the end
@@ -167,7 +224,8 @@ fn main() {
     // TODO IMR.TBMIM = 1 (for line start)
     // TODO IMR.TBTOIM = 1 (for row count)
     h_timer.imr.modify(|_, w| {
-        w.cbeim().set_bit(); // PWM triggers the capture event bit
+        w.caeim().set_bit(); // Timer0A fires at start of line
+        w.cbeim().set_bit(); // Timer0B is start of data
         w
     });
 
@@ -203,39 +261,46 @@ fn main() {
     h_timer
         .ctl
         .modify(|_, w| w.taen().set_bit().tben().set_bit());
-
-    // let mut itm = hio::hstdout().unwrap();
-    // let mut d = Delay::new(cp.SYST, &clocks);
-    // let mut last = 0;
-    // loop {
-    //     let a = unsafe { ISR_COUNT };
-    //     writeln!(itm, "{}", a - last).unwrap();
-    //     last = a;
-    //     d.delay_ms(1000u32);
-    // }
 }
 
-static mut ISR_COUNT: u32 = 0;
-
-extern "C" fn timer0_isr() {
+extern "C" fn timer0a_isr() {
     let p = unsafe { tm4c123x_hal::Peripherals::steal() };
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x01) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x03) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x07) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x0F) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x1F) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x3F) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0x7F) });
-    p.SSI2.dr.write(|w| unsafe { w.data().bits(0xFF) });
-    // p.GPIO_PORTB.data.write(|w| unsafe { w.bits(1 << 7) });
-    // asm::nop();
-    // asm::nop();
-    // asm::nop();
-    // asm::nop();
-    // asm::nop();
-    // p.GPIO_PORTB.data.write(|w| unsafe { w.bits(0) });
+    p.TIMER0.icr.write(|w| w.caecint().set_bit());
+    // Increment line number
     unsafe {
-        ISR_COUNT += 1;
+        let mut line_no = LINE_NUMBER + 1;
+        if line_no == V_WHOLE_FRAME {
+            line_no = 0;
+        }
+        if line_no < V_SYNC_PULSE {
+            // Sync pulse
+        } else if line_no < V_SYNC_PULSE + V_BACK_PORCH {
+            // Back porch
+            IS_VISIBLE = false;
+        } else if line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA {
+            // Visible lines
+            IS_VISIBLE = true;
+            FB_LINE = (line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
+        } else {
+            // Front porch
+            IS_VISIBLE = false;
+        }
+        LINE_NUMBER = line_no;
+    }
+}
+
+extern "C" fn timer0b_isr() {
+    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
+    if unsafe { IS_VISIBLE } {
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][0]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][1]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][2]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][3]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][4]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][5]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][6]) });
+        p.SSI2.dr.write(|w| unsafe { w.data().bits(FRAMEBUFFER[FB_LINE as usize][7]) });
+        // Todo write out rest of data when FIFO empty...
     }
     p.TIMER0.icr.write(|w| w.cbecint().set_bit());
 }
@@ -292,9 +357,9 @@ static INTERRUPTS: [Option<extern "C" fn()>; 139] = [
     // WDT 0 and 1                      34
     Some(default_handler),
     // 16/32 bit timer 0 A              35
-    Some(default_handler),
+    Some(timer0a_isr),
     // 16/32 bit timer 0 B              36
-    Some(timer0_isr),
+    Some(timer0b_isr),
     // 16/32 bit timer 1 A              37
     Some(default_handler),
     // 16/32 bit timer 1 B              38
