@@ -29,6 +29,7 @@ debug = true
 
 [dependencies]
 tm4c123x-hal = { path = "../tm4c123x-hal" }
+bresenham = "0.1.1"
 
 [dependencies.embedded-hal]
 version = "0.1.1"
