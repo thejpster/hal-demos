@@ -35,8 +35,9 @@ extern crate cortex_m_semihosting;
 extern crate embedded_hal;
 extern crate tm4c123x_hal;
 
-use core::sync::atomic::{Ordering, AtomicUsize, AtomicBool};
 use cortex_m::asm;
+use core::cell::RefCell;
+use cortex_m::interrupt::{CriticalSection, Mutex};
 use tm4c123x_hal::gpio::GpioExt;
 use tm4c123x_hal::sysctl::{self, SysctlExt};
 use tm4c123x_hal::bb;
@@ -61,18 +62,23 @@ struct DmaInfo {
     _data: [u8; 1024],
 }
 
+struct FbInfo {
+    line_no: usize,
+    is_visible: bool,
+    fb_line: usize
+}
+
 /// Required by the DMA engine
 #[used]
 static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
 /// Mono framebuffer, arranged in lines.
 static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = include!("rust_logo.inc");
 
-/// 0 .. V_WHOLE_FRAME
-static mut LINE_NUMBER: AtomicUsize = AtomicUsize::new(0);
-/// true if visible, false in blanking interval
-static mut IS_VISIBLE: AtomicBool = AtomicBool::new(false);
-/// 0 .. VISIBLE_LINES
-static mut FB_LINE: AtomicUsize = AtomicUsize::new(0);
+static FB_INFO: Mutex<RefCell<FbInfo>> = Mutex::new(RefCell::new(FbInfo {
+    line_no: 0,
+    is_visible: false,
+    fb_line: 0
+}));
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
     sysctl::control_power(sc, p, sysctl::RunMode::Run, sysctl::PowerState::On);
@@ -238,42 +244,42 @@ fn main() {
 extern "C" fn timer0a_isr() {
     let p = unsafe { tm4c123x_hal::Peripherals::steal() };
     p.TIMER0.icr.write(|w| w.caecint().set_bit());
+    let cs = unsafe { CriticalSection::new() };
+    let mut fb_info = FB_INFO.borrow(&cs).borrow_mut();
     // Increment line number
     unsafe {
-        let mut line_no = LINE_NUMBER.load(Ordering::Relaxed);
-        line_no += 1;
+        fb_info.line_no += 1;
 
-        if line_no == V_WHOLE_FRAME {
-            line_no = 0;
+        if fb_info.line_no == V_WHOLE_FRAME {
+            fb_info.line_no = 0;
             bb::change_bit(&p.GPIO_PORTC.data, 4, true);
         }
 
-        if line_no == V_SYNC_PULSE {
+        if fb_info.line_no == V_SYNC_PULSE {
             bb::change_bit(&p.GPIO_PORTC.data, 4, false);
         }
 
-        if (line_no >= V_SYNC_PULSE + V_BACK_PORCH)
-            && (line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
+        if (fb_info.line_no >= V_SYNC_PULSE + V_BACK_PORCH)
+            && (fb_info.line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
         {
             // Visible lines
-            IS_VISIBLE.store(true, Ordering::Relaxed);
+            fb_info.is_visible = true;
             // 600 visible lines, 300 output lines each shown twice
-            FB_LINE.store((line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1, Ordering::Relaxed);
+            fb_info.fb_line = (fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
         } else {
             // Front porch
-            IS_VISIBLE.store(false, Ordering::Relaxed);
+            fb_info.is_visible = false;
         }
-
-        LINE_NUMBER.store(line_no, Ordering::Relaxed);
     }
 }
 
 extern "C" fn timer0b_isr() {
     unsafe {
         let p = tm4c123x_hal::Peripherals::steal();
-        if IS_VISIBLE.load(Ordering::Relaxed) {
-            let line = FB_LINE.load(Ordering::Relaxed);
-            for word in FRAMEBUFFER[line].iter() {
+        let cs = CriticalSection::new();
+        let fb_info = FB_INFO.borrow(&cs).borrow();
+        if fb_info.is_visible {
+            for word in FRAMEBUFFER[fb_info.fb_line].iter() {
                 p.SSI2.dr.write(|w| w.data().bits(*word));
                 while p.SSI2.sr.read().tnf().bit_is_clear() {
                     asm::nop();
