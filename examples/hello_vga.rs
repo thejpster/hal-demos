@@ -65,7 +65,7 @@ struct DmaInfo {
 struct FbInfo {
     line_no: usize,
     is_visible: bool,
-    fb_line: usize
+    fb_line: usize,
 }
 
 /// Required by the DMA engine
@@ -77,7 +77,7 @@ static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = include!("rust_logo.inc");
 static FB_INFO: Mutex<RefCell<FbInfo>> = Mutex::new(RefCell::new(FbInfo {
     line_no: 0,
     is_visible: false,
-    fb_line: 0
+    fb_line: 0,
 }));
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
@@ -241,53 +241,57 @@ fn main() {
     });
 }
 
-extern "C" fn timer0a_isr() {
-    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
-    p.TIMER0.icr.write(|w| w.caecint().set_bit());
-    let cs = unsafe { CriticalSection::new() };
-    let mut fb_info = FB_INFO.borrow(&cs).borrow_mut();
-    // Increment line number
-    unsafe {
-        fb_info.line_no += 1;
+fn start_of_line(p: &tm4c123x_hal::Peripherals, fb_info: &mut FbInfo) {
+    fb_info.line_no += 1;
 
-        if fb_info.line_no == V_WHOLE_FRAME {
-            fb_info.line_no = 0;
-            bb::change_bit(&p.GPIO_PORTC.data, 4, true);
-        }
+    if fb_info.line_no == V_WHOLE_FRAME {
+        fb_info.line_no = 0;
+        unsafe { bb::change_bit(&p.GPIO_PORTC.data, 4, true) };
+    }
 
-        if fb_info.line_no == V_SYNC_PULSE {
-            bb::change_bit(&p.GPIO_PORTC.data, 4, false);
-        }
+    if fb_info.line_no == V_SYNC_PULSE {
+        unsafe { bb::change_bit(&p.GPIO_PORTC.data, 4, false) };
+    }
 
-        if (fb_info.line_no >= V_SYNC_PULSE + V_BACK_PORCH)
-            && (fb_info.line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
-        {
-            // Visible lines
-            fb_info.is_visible = true;
-            // 600 visible lines, 300 output lines each shown twice
-            fb_info.fb_line = (fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
-        } else {
-            // Front porch
-            fb_info.is_visible = false;
+    if (fb_info.line_no >= V_SYNC_PULSE + V_BACK_PORCH)
+        && (fb_info.line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
+    {
+        // Visible lines
+        fb_info.is_visible = true;
+        // 600 visible lines, 300 output lines each shown twice
+        fb_info.fb_line = (fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
+    } else {
+        // Front porch
+        fb_info.is_visible = false;
+    }
+}
+
+fn start_of_data(p: &tm4c123x_hal::Peripherals, fb_info: &FbInfo) {
+    if fb_info.is_visible {
+        let iter = unsafe { FRAMEBUFFER[fb_info.fb_line].iter() };
+        for word in iter {
+            p.SSI2.dr.write(|w| unsafe { w.data().bits(*word) });
+            while p.SSI2.sr.read().tnf().bit_is_clear() {
+                asm::nop();
+            }
         }
     }
 }
 
+extern "C" fn timer0a_isr() {
+    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
+    let cs = unsafe { CriticalSection::new() };
+    let mut fb_info = FB_INFO.borrow(&cs).borrow_mut();
+    start_of_line(&p, &mut fb_info);
+    p.TIMER0.icr.write(|w| w.caecint().set_bit());
+}
+
 extern "C" fn timer0b_isr() {
-    unsafe {
-        let p = tm4c123x_hal::Peripherals::steal();
-        let cs = CriticalSection::new();
-        let fb_info = FB_INFO.borrow(&cs).borrow();
-        if fb_info.is_visible {
-            for word in FRAMEBUFFER[fb_info.fb_line].iter() {
-                p.SSI2.dr.write(|w| w.data().bits(*word));
-                while p.SSI2.sr.read().tnf().bit_is_clear() {
-                    asm::nop();
-                }
-            }
-        }
-        p.TIMER0.icr.write(|w| w.cbecint().set_bit());
-    }
+    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
+    let cs = unsafe { CriticalSection::new() };
+    let fb_info = FB_INFO.borrow(&cs).borrow();
+    start_of_data(&p, &fb_info);
+    p.TIMER0.icr.write(|w| w.cbecint().set_bit());
 }
 
 extern "C" fn default_handler() {
