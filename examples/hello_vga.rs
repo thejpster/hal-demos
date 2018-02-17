@@ -36,7 +36,6 @@ extern crate embedded_hal;
 extern crate tm4c123x_hal;
 
 use cortex_m::asm;
-use core::ptr;
 use core::cell::RefCell;
 use cortex_m::interrupt::{CriticalSection, Mutex};
 use tm4c123x_hal::gpio::GpioExt;
@@ -62,26 +61,135 @@ const FONT_WIDTH: usize = 8;
 const FONT_HEIGHT: usize = 16;
 /// Number of lines in frame buffer
 const VISIBLE_LINES: usize = 300;
+/// Number of lines the text is rendered to.
+const VISIBLE_LINES_WITH_TEXT: usize = TEXT_MAX_ROWS * FONT_HEIGHT;
 /// Number of columns in frame buffer
 const VISIBLE_COLS: usize = 400;
 /// How many 16-bit words in a line
 const HORIZONTAL_WORDS: usize = (VISIBLE_COLS + 15) / 16;
 /// How many characters in a line
 const TEXT_MAX_COLS: usize = VISIBLE_COLS / FONT_WIDTH;
+/// Highest X co-ord for text
+const MAX_X: usize = TEXT_MAX_COLS - 1;
 /// How many lines of characters on the screen
 const TEXT_MAX_ROWS: usize = VISIBLE_LINES / FONT_HEIGHT;
+/// Highest Y co-ord for text
+const MAX_Y: usize = TEXT_MAX_ROWS - 1;
 
 #[repr(align(1024))]
 struct DmaInfo {
     _data: [u8; 1024],
 }
 
+/// This is our own custom character set.
+#[repr(u8)]
+#[derive(Copy, Clone)]
+#[allow(dead_code)]
+enum Glyph {
+    Unknown,
+    Space,
+    ExclamationMark,
+    DoubleQuote,
+    Hash,
+    Dollar,
+    Percent,
+    Ampersand,
+    SingleQuote,
+    OpenRoundBracket,
+    CloseRoundBracket,
+    Asterisk,
+    Plus,
+    Comma,
+    Minus,
+    Period,
+    Slash,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Colon,
+    SemiColon,
+    LessThan,
+    Equals,
+    GreaterThan,
+    QuestionMark,
+    At,
+    UppercaseA,
+    UppercaseB,
+    UppercaseC,
+    UppercaseD,
+    UppercaseE,
+    UppercaseF,
+    UppercaseG,
+    UppercaseH,
+    UppercaseI,
+    UppercaseJ,
+    UppercaseK,
+    UppercaseL,
+    UppercaseM,
+    UppercaseN,
+    UppercaseO,
+    UppercaseP,
+    UppercaseQ,
+    UppercaseR,
+    UppercaseS,
+    UppercaseT,
+    UppercaseU,
+    UppercaseV,
+    UppercaseW,
+    UppercaseX,
+    UppercaseY,
+    UppercaseZ,
+    OpenSquareBracket,
+    Backslash,
+    CloseSquareBracket,
+    Caret,
+    Underscore,
+    Backtick,
+    LowercaseA,
+    LowercaseB,
+    LowercaseC,
+    LowercaseD,
+    LowercaseE,
+    LowercaseF,
+    LowercaseG,
+    LowercaseH,
+    LowercaseI,
+    LowercaseJ,
+    LowercaseK,
+    LowercaseL,
+    LowercaseM,
+    LowercaseN,
+    LowercaseO,
+    LowercaseP,
+    LowercaseQ,
+    LowercaseR,
+    LowercaseS,
+    LowercaseT,
+    LowercaseU,
+    LowercaseV,
+    LowercaseW,
+    LowercaseX,
+    LowercaseY,
+    LowercaseZ,
+    OpenBrace,
+    VerticalBar,
+    CloseBrace,
+    Tilde,
+}
+
 struct FrameBuffer {
     line_no: usize,
-    is_visible: bool,
-    fb_line: usize,
-    buffer: [[u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
-    // text: [[u8; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
+    fb_line: Option<usize>,
+    /// The first index is the row (y), then the column (x) (`text[y][x]`)
+    text: [[Glyph; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
+    render_line: [u16; HORIZONTAL_WORDS],
 }
 
 /// Required by the DMA engine
@@ -91,11 +199,9 @@ static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
 
 static FB_INFO: Mutex<RefCell<FrameBuffer>> = Mutex::new(RefCell::new(FrameBuffer {
     line_no: 0,
-    is_visible: false,
-    fb_line: 0,
-    /// Arranged as lines of 25 u16 words (= 400 pixels)
-    buffer: [[0u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
-    // text: [[0u8; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
+    fb_line: None,
+    text: [[Glyph::Space; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
+    render_line: [0u16; HORIZONTAL_WORDS],
 }));
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
@@ -105,26 +211,15 @@ fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
 }
 
 impl FrameBuffer {
-    /// Render a character to the frame buffer.
+    /// Write a character to the text buffer.
     fn write_char(&mut self, ch: char, x: usize, y: usize) {
         if (x < TEXT_MAX_COLS) && (y < TEXT_MAX_ROWS) {
-            let odd = (x & 1) == 1;
-            let word = x / 2;
-            for row in 0..FONT_HEIGHT {
-                let line = ((y * FONT_HEIGHT) + row) % VISIBLE_LINES;
-                let mut d = self.buffer[line][word];
-                if odd {
-                    d &= 0xFF00;
-                    d |= font_lookup(ch, row) as u16;
-                } else {
-                    d &= 0x00FF;
-                    d |= (font_lookup(ch, row) as u16) << 8;
-                }
-                self.buffer[line][word] = d;
-            }
+            self.text[y][x] = FrameBuffer::map_char(ch);
         }
     }
 
+    /// Write a string to the text buffer. Wraps off the end of the screen
+    /// automatically.
     fn write_string(&mut self, message: &str, mut x: usize, mut y: usize) {
         for ch in message.chars() {
             self.write_char(ch, x, y);
@@ -139,34 +234,1562 @@ impl FrameBuffer {
         }
     }
 
-    fn clear(&mut self) {
-        unsafe {
-            ptr::write_bytes(self.buffer.as_mut_ptr(), 0, VISIBLE_LINES);
+    /// Convert a Unicode code-point to a glyph.
+    fn map_char(ch: char) -> Glyph {
+        match ch {
+            'A' => Glyph::UppercaseA,
+            'B' => Glyph::UppercaseB,
+            'C' => Glyph::UppercaseC,
+            'D' => Glyph::UppercaseD,
+            'R' => Glyph::UppercaseR,
+            ' ' => Glyph::Space,
+            _ => Glyph::Unknown,
         }
+    }
+
+    /// Calculate a line of pixels.
+    fn render(&mut self) {
+        if let Some(line) = self.fb_line {
+            if line < VISIBLE_LINES_WITH_TEXT {
+                let text_row = line / FONT_HEIGHT;
+                let font_row = line % FONT_HEIGHT;
+                for (word_col, word_ref) in self.render_line.iter_mut().enumerate() {
+                    let text_col = word_col * 2;
+                    let left = Self::font_lookup(self.text[text_row][text_col], font_row) as u16;
+                    let right = Self::font_lookup(self.text[text_row][text_col + 1], font_row) as u16;
+                    *word_ref = (left << 8) | right;
+                }
+            } else {
+                for word_ref in self.render_line.iter_mut() {
+                    *word_ref = 0;
+                }
+            }
+        }
+    }
+
+    // /// Convert the glyph enum to the bits needed for a given line of that glyph.
+    // fn font_lookup(glyph: Glyph, row: usize) -> u8 {
+    //     match glyph {
+    //         Glyph::ExclamationMark => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::DoubleQuote => match row {
+    //             0 => 0x24,
+    //             1 => 0x24,
+    //             2 => 0x24,
+    //             3 => 0x24,
+    //             4 => 0x24,
+    //             5 => 0x24,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Hash => match row {
+    //             0 => 0x24,
+    //             1 => 0x24,
+    //             2 => 0x24,
+    //             3 => 0x24,
+    //             4 => 0x7E,
+    //             5 => 0x7E,
+    //             6 => 0x24,
+    //             7 => 0x24,
+    //             8 => 0x7E,
+    //             9 => 0x7E,
+    //             10 => 0x24,
+    //             11 => 0x24,
+    //             12 => 0x24,
+    //             13 => 0x24,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Dollar => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x3C,
+    //             3 => 0x3C,
+    //             4 => 0x50,
+    //             5 => 0x50,
+    //             6 => 0x38,
+    //             7 => 0x38,
+    //             8 => 0x14,
+    //             9 => 0x14,
+    //             10 => 0x78,
+    //             11 => 0x78,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Percent => match row {
+    //             2 => 0x62,
+    //             3 => 0x62,
+    //             4 => 0x64,
+    //             5 => 0x64,
+    //             6 => 0x08,
+    //             7 => 0x08,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x26,
+    //             11 => 0x26,
+    //             12 => 0x46,
+    //             13 => 0x46,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Ampersand => match row {
+    //             0 => 0x30,
+    //             1 => 0x30,
+    //             2 => 0x48,
+    //             3 => 0x48,
+    //             4 => 0x48,
+    //             5 => 0x48,
+    //             6 => 0x30,
+    //             7 => 0x30,
+    //             8 => 0x4A,
+    //             9 => 0x4A,
+    //             10 => 0x44,
+    //             11 => 0x44,
+    //             12 => 0x3A,
+    //             13 => 0x3A,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::SingleQuote => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::OpenRoundBracket => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x20,
+    //             3 => 0x20,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x40,
+    //             7 => 0x40,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x20,
+    //             11 => 0x20,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::CloseRoundBracket => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x08,
+    //             3 => 0x08,
+    //             4 => 0x04,
+    //             5 => 0x04,
+    //             6 => 0x04,
+    //             7 => 0x04,
+    //             8 => 0x04,
+    //             9 => 0x04,
+    //             10 => 0x08,
+    //             11 => 0x08,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Asterisk => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x54,
+    //             3 => 0x54,
+    //             4 => 0x38,
+    //             5 => 0x38,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x38,
+    //             9 => 0x38,
+    //             10 => 0x54,
+    //             11 => 0x54,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Plus => match row {
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Comma => match row {
+    //             8 => 0x08,
+    //             9 => 0x08,
+    //             10 => 0x08,
+    //             11 => 0x08,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Minus => match row {
+    //             6 => 0x7E,
+    //             7 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Period => match row {
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Slash => match row {
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x04,
+    //             5 => 0x04,
+    //             6 => 0x08,
+    //             7 => 0x08,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x20,
+    //             11 => 0x20,
+    //             12 => 0x40,
+    //             13 => 0x40,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit0 => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x46,
+    //             5 => 0x46,
+    //             6 => 0x5A,
+    //             7 => 0x5A,
+    //             8 => 0x62,
+    //             9 => 0x62,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit1 => match row {
+    //             0 => 0x08,
+    //             1 => 0x08,
+    //             2 => 0x18,
+    //             3 => 0x18,
+    //             4 => 0x08,
+    //             5 => 0x08,
+    //             6 => 0x08,
+    //             7 => 0x08,
+    //             8 => 0x08,
+    //             9 => 0x08,
+    //             10 => 0x08,
+    //             11 => 0x08,
+    //             12 => 0x1C,
+    //             13 => 0x1C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit2 => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x02,
+    //             5 => 0x02,
+    //             6 => 0x1C,
+    //             7 => 0x1C,
+    //             8 => 0x20,
+    //             9 => 0x20,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit3 => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x04,
+    //             5 => 0x04,
+    //             6 => 0x1C,
+    //             7 => 0x1C,
+    //             8 => 0x02,
+    //             9 => 0x02,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit4 => match row {
+    //             0 => 0x04,
+    //             1 => 0x04,
+    //             2 => 0x0C,
+    //             3 => 0x0C,
+    //             4 => 0x14,
+    //             5 => 0x14,
+    //             6 => 0x24,
+    //             7 => 0x24,
+    //             8 => 0x7E,
+    //             9 => 0x7E,
+    //             10 => 0x04,
+    //             11 => 0x04,
+    //             12 => 0x04,
+    //             13 => 0x04,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit5 => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x02,
+    //             7 => 0x02,
+    //             8 => 0x02,
+    //             9 => 0x02,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit6 => match row {
+    //             0 => 0x1E,
+    //             1 => 0x1E,
+    //             2 => 0x20,
+    //             3 => 0x20,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit7 => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x04,
+    //             5 => 0x04,
+    //             6 => 0x08,
+    //             7 => 0x08,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit8 => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x3C,
+    //             7 => 0x3C,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Digit9 => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x3E,
+    //             7 => 0x3E,
+    //             8 => 0x02,
+    //             9 => 0x02,
+    //             10 => 0x04,
+    //             11 => 0x04,
+    //             12 => 0x78,
+    //             13 => 0x78,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Colon => match row {
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::SemiColon => match row {
+    //             4 => 0x08,
+    //             5 => 0x08,
+    //             8 => 0x08,
+    //             9 => 0x08,
+    //             10 => 0x08,
+    //             11 => 0x08,
+    //             12 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LessThan => match row {
+    //             0 => 0x04,
+    //             1 => 0x04,
+    //             2 => 0x08,
+    //             3 => 0x08,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x20,
+    //             7 => 0x20,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x08,
+    //             11 => 0x08,
+    //             12 => 0x04,
+    //             13 => 0x04,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Equals => match row {
+    //             4 => 0x7E,
+    //             5 => 0x7E,
+    //             8 => 0x7E,
+    //             9 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::GreaterThan => match row {
+    //             0 => 0x20,
+    //             1 => 0x20,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x08,
+    //             5 => 0x08,
+    //             6 => 0x04,
+    //             7 => 0x04,
+    //             8 => 0x08,
+    //             9 => 0x08,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x20,
+    //             13 => 0x20,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::QuestionMark => match row {
+    //             0 => 0x20,
+    //             1 => 0x20,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::At => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x4A,
+    //             5 => 0x4A,
+    //             6 => 0x56,
+    //             7 => 0x56,
+    //             8 => 0x4C,
+    //             9 => 0x4C,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseA => match row {
+    //             0 => 0x18,
+    //             1 => 0x18,
+    //             2 => 0x24,
+    //             3 => 0x24,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x7E,
+    //             9 => 0x7E,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseB => match row {
+    //             0 => 0x7C,
+    //             1 => 0x7C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x7C,
+    //             13 => 0x7C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseC => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x40,
+    //             7 => 0x40,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseD => match row {
+    //             0 => 0x7C,
+    //             1 => 0x7C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x7C,
+    //             13 => 0x7C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseE => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseF => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x40,
+    //             13 => 0x40,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseG => match row {
+    //             0 => 0x3E,
+    //             1 => 0x3E,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x40,
+    //             7 => 0x4E,
+    //             8 => 0x4E,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseH => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x7E,
+    //             7 => 0x7E,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseI => match row {
+    //             0 => 0x38,
+    //             1 => 0x38,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x38,
+    //             13 => 0x38,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseJ => match row {
+    //             0 => 0x02,
+    //             1 => 0x02,
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x02,
+    //             5 => 0x02,
+    //             6 => 0x02,
+    //             7 => 0x02,
+    //             8 => 0x02,
+    //             9 => 0x02,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseK => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x44,
+    //             3 => 0x44,
+    //             4 => 0x48,
+    //             5 => 0x48,
+    //             6 => 0x70,
+    //             7 => 0x70,
+    //             8 => 0x48,
+    //             9 => 0x48,
+    //             10 => 0x44,
+    //             11 => 0x44,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseL => match row {
+    //             0 => 0x40,
+    //             1 => 0x40,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x40,
+    //             7 => 0x40,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseM => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x66,
+    //             3 => 0x66,
+    //             4 => 0x5A,
+    //             5 => 0x5A,
+    //             6 => 0x5A,
+    //             7 => 0x5A,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseN => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x62,
+    //             3 => 0x62,
+    //             4 => 0x52,
+    //             5 => 0x52,
+    //             6 => 0x5A,
+    //             7 => 0x5A,
+    //             8 => 0x4A,
+    //             9 => 0x4A,
+    //             10 => 0x46,
+    //             11 => 0x46,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseO => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseP => match row {
+    //             0 => 0x7C,
+    //             1 => 0x7C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x40,
+    //             13 => 0x40,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseQ => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x4A,
+    //             9 => 0x4A,
+    //             10 => 0x44,
+    //             11 => 0x44,
+    //             12 => 0x3A,
+    //             13 => 0x3A,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseR => match row {
+    //             0 => 0x7C,
+    //             1 => 0x7C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x48,
+    //             9 => 0x48,
+    //             10 => 0x44,
+    //             11 => 0x44,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseS => match row {
+    //             0 => 0x3C,
+    //             1 => 0x3C,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x40,
+    //             5 => 0x40,
+    //             6 => 0x3C,
+    //             7 => 0x3C,
+    //             8 => 0x02,
+    //             9 => 0x02,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseT => match row {
+    //             0 => 0x7C,
+    //             1 => 0x7C,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseU => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseV => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x24,
+    //             11 => 0x24,
+    //             12 => 0x18,
+    //             13 => 0x18,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseW => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x5A,
+    //             7 => 0x5A,
+    //             8 => 0x5A,
+    //             9 => 0x5A,
+    //             10 => 0x66,
+    //             11 => 0x66,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseX => match row {
+    //             0 => 0x42,
+    //             1 => 0x42,
+    //             2 => 0x42,
+    //             3 => 0x42,
+    //             4 => 0x24,
+    //             5 => 0x24,
+    //             6 => 0x18,
+    //             7 => 0x18,
+    //             8 => 0x24,
+    //             9 => 0x24,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseY => match row {
+    //             0 => 0x44,
+    //             1 => 0x44,
+    //             2 => 0x44,
+    //             3 => 0x44,
+    //             4 => 0x28,
+    //             5 => 0x28,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::UppercaseZ => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x04,
+    //             5 => 0x04,
+    //             6 => 0x18,
+    //             7 => 0x18,
+    //             8 => 0x20,
+    //             9 => 0x20,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::OpenSquareBracket => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x60,
+    //             3 => 0x60,
+    //             4 => 0x60,
+    //             5 => 0x60,
+    //             6 => 0x60,
+    //             7 => 0x60,
+    //             8 => 0x60,
+    //             9 => 0x60,
+    //             10 => 0x60,
+    //             11 => 0x60,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Backslash => match row {
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x20,
+    //             5 => 0x20,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x08,
+    //             9 => 0x08,
+    //             10 => 0x04,
+    //             11 => 0x04,
+    //             12 => 0x02,
+    //             13 => 0x02,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::CloseSquareBracket => match row {
+    //             0 => 0x7E,
+    //             1 => 0x7E,
+    //             2 => 0x06,
+    //             3 => 0x06,
+    //             4 => 0x06,
+    //             5 => 0x06,
+    //             6 => 0x06,
+    //             7 => 0x06,
+    //             8 => 0x06,
+    //             9 => 0x06,
+    //             10 => 0x06,
+    //             11 => 0x06,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Caret => match row {
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x28,
+    //             7 => 0x28,
+    //             8 => 0x44,
+    //             9 => 0x44,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Underscore => match row {
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Backtick => match row {
+    //             0 => 0x20,
+    //             1 => 0x20,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x08,
+    //             5 => 0x08,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseA => match row {
+    //             4 => 0x3C,
+    //             5 => 0x3C,
+    //             6 => 0x02,
+    //             7 => 0x02,
+    //             8 => 0x3E,
+    //             9 => 0x3E,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseB => match row {
+    //             0 => 0x40,
+    //             1 => 0x40,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x7C,
+    //             13 => 0x7C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseC => match row {
+    //             4 => 0x3E,
+    //             5 => 0x3E,
+    //             6 => 0x40,
+    //             7 => 0x40,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseD => match row {
+    //             0 => 0x02,
+    //             1 => 0x02,
+    //             2 => 0x02,
+    //             3 => 0x02,
+    //             4 => 0x3E,
+    //             5 => 0x3E,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseE => match row {
+    //             4 => 0x3C,
+    //             5 => 0x3C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x7E,
+    //             9 => 0x7E,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x3E,
+    //             13 => 0x3E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseF => match row {
+    //             0 => 0x1C,
+    //             1 => 0x1C,
+    //             2 => 0x22,
+    //             3 => 0x22,
+    //             4 => 0x20,
+    //             5 => 0x20,
+    //             6 => 0x7C,
+    //             7 => 0x7C,
+    //             8 => 0x20,
+    //             9 => 0x20,
+    //             10 => 0x20,
+    //             11 => 0x20,
+    //             12 => 0x20,
+    //             13 => 0x20,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseG => match row {
+    //             4 => 0x3C,
+    //             5 => 0x3C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x3E,
+    //             11 => 0x3E,
+    //             12 => 0x02,
+    //             13 => 0x02,
+    //             14 => 0x3C,
+    //             15 => 0x3C, // g
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseH => match row {
+    //             0 => 0x40,
+    //             1 => 0x40,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseI => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             4 => 0x30,
+    //             5 => 0x30,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x38,
+    //             13 => 0x38,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseJ => match row {
+    //             0 => 0x04,
+    //             1 => 0x04,
+    //             4 => 0x3C,
+    //             5 => 0x3C,
+    //             6 => 0x04,
+    //             7 => 0x04,
+    //             8 => 0x04,
+    //             9 => 0x04,
+    //             10 => 0x04,
+    //             11 => 0x04,
+    //             12 => 0x44,
+    //             13 => 0x44,
+    //             14 => 0x38,
+    //             15 => 0x38, // j
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseK => match row {
+    //             0 => 0x40,
+    //             1 => 0x40,
+    //             2 => 0x40,
+    //             3 => 0x40,
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x44,
+    //             7 => 0x44,
+    //             8 => 0x78,
+    //             9 => 0x78,
+    //             10 => 0x44,
+    //             11 => 0x44,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseL => match row {
+    //             0 => 0x30,
+    //             1 => 0x30,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x38,
+    //             13 => 0x38,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseM => match row {
+    //             4 => 0x66,
+    //             5 => 0x66,
+    //             6 => 0x5A,
+    //             7 => 0x5A,
+    //             8 => 0x5A,
+    //             9 => 0x5A,
+    //             10 => 0x5A,
+    //             11 => 0x5A,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseN => match row {
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseO => match row {
+    //             4 => 0x3C,
+    //             5 => 0x3C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x42,
+    //             11 => 0x42,
+    //             12 => 0x3C,
+    //             13 => 0x3C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseP => match row {
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x7C,
+    //             11 => 0x7C,
+    //             12 => 0x40,
+    //             13 => 0x40,
+    //             14 => 0x40,
+    //             15 => 0x40, // p
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseQ => match row {
+    //             4 => 0x3E,
+    //             5 => 0x3E,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x3E,
+    //             11 => 0x3E,
+    //             12 => 0x02,
+    //             13 => 0x02,
+    //             14 => 0x02,
+    //             15 => 0x02, // q
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseR => match row {
+    //             4 => 0x5E,
+    //             5 => 0x5E,
+    //             6 => 0x60,
+    //             7 => 0x60,
+    //             8 => 0x40,
+    //             9 => 0x40,
+    //             10 => 0x40,
+    //             11 => 0x40,
+    //             12 => 0x40,
+    //             13 => 0x40,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseS => match row {
+    //             4 => 0x3E,
+    //             5 => 0x3E,
+    //             6 => 0x40,
+    //             7 => 0x40,
+    //             8 => 0x3C,
+    //             9 => 0x3C,
+    //             10 => 0x02,
+    //             11 => 0x02,
+    //             12 => 0x7C,
+    //             13 => 0x7C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseT => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x7C,
+    //             5 => 0x7C,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x12,
+    //             11 => 0x12,
+    //             12 => 0x0C,
+    //             13 => 0x0C,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseU => match row {
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x46,
+    //             11 => 0x46,
+    //             12 => 0x3A,
+    //             13 => 0x3A,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseV => match row {
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x24,
+    //             11 => 0x24,
+    //             12 => 0x18,
+    //             13 => 0x18,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseW => match row {
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x5A,
+    //             9 => 0x5A,
+    //             10 => 0x5A,
+    //             11 => 0x5A,
+    //             12 => 0x66,
+    //             13 => 0x66,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseX => match row {
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x24,
+    //             7 => 0x24,
+    //             8 => 0x18,
+    //             9 => 0x18,
+    //             10 => 0x24,
+    //             11 => 0x24,
+    //             12 => 0x42,
+    //             13 => 0x42,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseY => match row {
+    //             4 => 0x42,
+    //             5 => 0x42,
+    //             6 => 0x42,
+    //             7 => 0x42,
+    //             8 => 0x42,
+    //             9 => 0x42,
+    //             10 => 0x3E,
+    //             11 => 0x3E,
+    //             12 => 0x02,
+    //             13 => 0x02,
+    //             14 => 0x3C,
+    //             15 => 0x3C, // y
+    //             _ => 0x00,
+    //         },
+    //         Glyph::LowercaseZ => match row {
+    //             4 => 0x7E,
+    //             5 => 0x7E,
+    //             6 => 0x04,
+    //             7 => 0x04,
+    //             8 => 0x18,
+    //             9 => 0x18,
+    //             10 => 0x20,
+    //             11 => 0x20,
+    //             12 => 0x7E,
+    //             13 => 0x7E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::OpenBrace => match row {
+    //             0 => 0x0E,
+    //             1 => 0x0E,
+    //             2 => 0x18,
+    //             3 => 0x18,
+    //             4 => 0x18,
+    //             5 => 0x18,
+    //             6 => 0x70,
+    //             7 => 0x70,
+    //             8 => 0x18,
+    //             9 => 0x18,
+    //             10 => 0x18,
+    //             11 => 0x18,
+    //             12 => 0x0E,
+    //             13 => 0x0E,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::VerticalBar => match row {
+    //             0 => 0x10,
+    //             1 => 0x10,
+    //             2 => 0x10,
+    //             3 => 0x10,
+    //             4 => 0x10,
+    //             5 => 0x10,
+    //             6 => 0x10,
+    //             7 => 0x10,
+    //             8 => 0x10,
+    //             9 => 0x10,
+    //             10 => 0x10,
+    //             11 => 0x10,
+    //             12 => 0x10,
+    //             13 => 0x10,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::CloseBrace => match row {
+    //             0 => 0x70,
+    //             1 => 0x70,
+    //             2 => 0x18,
+    //             3 => 0x18,
+    //             4 => 0x18,
+    //             5 => 0x18,
+    //             6 => 0x0E,
+    //             7 => 0x0E,
+    //             8 => 0x18,
+    //             9 => 0x18,
+    //             10 => 0x18,
+    //             11 => 0x18,
+    //             12 => 0x70,
+    //             13 => 0x70,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Tilde => match row {
+    //             4 => 0x24,
+    //             5 => 0x24,
+    //             6 => 0x54,
+    //             7 => 0x54,
+    //             8 => 0x48,
+    //             9 => 0x48,
+    //             _ => 0x00,
+    //         },
+    //         Glyph::Space => match row {
+    //             _ => 0b00000000,
+    //         },
+    //         _ => match row {
+    //             _ => 0b11111111,
+    //         },
+    //     }
+    // }
+    fn font_lookup(glyph: Glyph, row: usize) -> u8 {
+        let index = ((glyph as usize) * FONT_HEIGHT) + row;
+        FONT_DATA[index]
     }
 }
 
-/// Always gives you captital A
-fn font_lookup(ch: char, row: usize) -> u8 {
-    match ch {
-        'A' => match row {
-            3 => 0b00010000,
-            4 => 0b00111000,
-            5 => 0b01101100,
-            6 => 0b11000110,
-            7 => 0b11000110,
-            8 => 0b11111110,
-            9 => 0b11000110,
-            10 => 0b11000110,
-            11 => 0b11000110,
-            12 => 0b11000110,
-            _ => 0b00000000,
-        },
-        _ => match row {
-            _ => 0b11111111,
-        },
-    }
-}
+const FONT_DATA: [u8; 1536] = [
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,  // <unknown>
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // <space>
+    0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,0x10,0x10,0x00,0x00,  // !
+    0x24,0x24,0x24,0x24,0x24,0x24,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // "
+    0x24,0x24,0x24,0x24,0x7E,0x7E,0x24,0x24,0x7E,0x7E,0x24,0x24,0x24,0x24,0x00,0x00,  // #
+    0x10,0x10,0x3C,0x3C,0x50,0x50,0x38,0x38,0x14,0x14,0x78,0x78,0x10,0x10,0x00,0x00,  // $
+    0x00,0x00,0x62,0x62,0x64,0x64,0x08,0x08,0x10,0x10,0x26,0x26,0x46,0x46,0x00,0x00,  // %
+    0x30,0x30,0x48,0x48,0x48,0x48,0x30,0x30,0x4A,0x4A,0x44,0x44,0x3A,0x3A,0x00,0x00,  // &
+    0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // '
+    0x10,0x10,0x20,0x20,0x40,0x40,0x40,0x40,0x40,0x40,0x20,0x20,0x10,0x10,0x00,0x00,  // (
+    0x10,0x10,0x08,0x08,0x04,0x04,0x04,0x04,0x04,0x04,0x08,0x08,0x10,0x10,0x00,0x00,  // )
+    0x10,0x10,0x54,0x54,0x38,0x38,0x10,0x10,0x38,0x38,0x54,0x54,0x10,0x10,0x00,0x00,  // *
+    0x00,0x00,0x10,0x10,0x10,0x10,0x7C,0x7C,0x10,0x10,0x10,0x10,0x00,0x00,0x00,0x00,  // +
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x08,0x08,0x08,0x08,0x10,0x10,0x00,0x00,  // ,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x7E,0x7E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // -
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x10,0x10,0x00,0x00,  // .
+    0x00,0x00,0x02,0x02,0x04,0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x40,0x40,0x00,0x00,  // /
+
+    0x3C,0x3C,0x42,0x42,0x46,0x46,0x5A,0x5A,0x62,0x62,0x42,0x42,0x3C,0x3C,0x00,0x00,  // 0
+    0x08,0x08,0x18,0x18,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x1C,0x1C,0x00,0x00,  // 1
+    0x3C,0x3C,0x42,0x42,0x02,0x02,0x1C,0x1C,0x20,0x20,0x40,0x40,0x7E,0x7E,0x00,0x00,  // 2
+    0x7E,0x7E,0x02,0x02,0x04,0x04,0x1C,0x1C,0x02,0x02,0x42,0x42,0x3C,0x3C,0x00,0x00,  // 3
+    0x04,0x04,0x0C,0x0C,0x14,0x14,0x24,0x24,0x7E,0x7E,0x04,0x04,0x04,0x04,0x00,0x00,  // 4
+    0x7E,0x7E,0x40,0x40,0x7C,0x7C,0x02,0x02,0x02,0x02,0x42,0x42,0x3C,0x3C,0x00,0x00,  // 5
+    0x1E,0x1E,0x20,0x20,0x40,0x40,0x7C,0x7C,0x42,0x42,0x42,0x42,0x3C,0x3C,0x00,0x00,  // 6
+    0x7E,0x7E,0x02,0x02,0x04,0x04,0x08,0x08,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,  // 7
+    0x3C,0x3C,0x42,0x42,0x42,0x42,0x3C,0x3C,0x42,0x42,0x42,0x42,0x3C,0x3C,0x00,0x00,  // 8
+    0x3C,0x3C,0x42,0x42,0x42,0x42,0x3E,0x3E,0x02,0x02,0x04,0x04,0x78,0x78,0x00,0x00,  // 9
+    0x00,0x00,0x00,0x00,0x10,0x10,0x00,0x00,0x10,0x10,0x00,0x00,0x00,0x00,0x00,0x00,  // :
+    0x00,0x00,0x00,0x00,0x08,0x08,0x00,0x00,0x08,0x08,0x08,0x08,0x10,0x00,0x00,0x00,  // ;
+    0x04,0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x10,0x10,0x08,0x08,0x04,0x04,0x00,0x00,  // <
+    0x00,0x00,0x00,0x00,0x7E,0x7E,0x00,0x00,0x7E,0x7E,0x00,0x00,0x00,0x00,0x00,0x00,  // =
+    0x20,0x20,0x10,0x10,0x08,0x08,0x04,0x04,0x08,0x08,0x10,0x10,0x20,0x20,0x00,0x00,  // >
+    0x20,0x20,0x40,0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // ?
+
+    0x3C,0x3C,0x42,0x42,0x4A,0x4A,0x56,0x56,0x4C,0x4C,0x40,0x40,0x3E,0x3E,0x00,0x00,  // @
+    0x18,0x18,0x24,0x24,0x42,0x42,0x42,0x42,0x7E,0x7E,0x42,0x42,0x42,0x42,0x00,0x00,  // A
+    0x7C,0x7C,0x42,0x42,0x42,0x42,0x7C,0x7C,0x42,0x42,0x42,0x42,0x7C,0x7C,0x00,0x00,  // B
+    0x3C,0x3C,0x42,0x42,0x40,0x40,0x40,0x40,0x40,0x40,0x42,0x42,0x3C,0x3C,0x00,0x00,  // C
+    0x7C,0x7C,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x7C,0x7C,0x00,0x00,  // D
+    0x7E,0x7E,0x40,0x40,0x40,0x40,0x7C,0x7C,0x40,0x40,0x40,0x40,0x7E,0x7E,0x00,0x00,  // E
+    0x7E,0x7E,0x40,0x40,0x40,0x40,0x7C,0x7C,0x40,0x40,0x40,0x40,0x40,0x40,0x00,0x00,  // F
+    0x3E,0x3E,0x40,0x40,0x40,0x40,0x40,0x4E,0x4E,0x42,0x42,0x42,0x3E,0x3E,0x00,0x00,  // G
+    0x42,0x42,0x42,0x42,0x42,0x42,0x7E,0x7E,0x42,0x42,0x42,0x42,0x42,0x42,0x00,0x00,  // H
+    0x38,0x38,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x38,0x38,0x00,0x00,  // I
+    0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x42,0x42,0x3C,0x3C,0x00,0x00,  // J
+    0x42,0x42,0x44,0x44,0x48,0x48,0x70,0x70,0x48,0x48,0x44,0x44,0x42,0x42,0x00,0x00,  // K
+    0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x7E,0x7E,0x00,0x00,  // L
+    0x42,0x42,0x66,0x66,0x5A,0x5A,0x5A,0x5A,0x42,0x42,0x42,0x42,0x42,0x42,0x00,0x00,  // M
+    0x42,0x42,0x62,0x62,0x52,0x52,0x5A,0x5A,0x4A,0x4A,0x46,0x46,0x42,0x42,0x00,0x00,  // N
+    0x3C,0x3C,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x3C,0x3C,0x00,0x00,  // O
+
+    0x7C,0x7C,0x42,0x42,0x42,0x42,0x7C,0x7C,0x40,0x40,0x40,0x40,0x40,0x40,0x00,0x00,  // P
+    0x3C,0x3C,0x42,0x42,0x42,0x42,0x42,0x42,0x4A,0x4A,0x44,0x44,0x3A,0x3A,0x00,0x00,  // Q
+    0x7C,0x7C,0x42,0x42,0x42,0x42,0x7C,0x7C,0x48,0x48,0x44,0x44,0x42,0x42,0x00,0x00,  // R
+    0x3C,0x3C,0x42,0x42,0x40,0x40,0x3C,0x3C,0x02,0x02,0x42,0x42,0x3C,0x3C,0x00,0x00,  // S
+    0x7C,0x7C,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,  // T
+    0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x3C,0x3C,0x00,0x00,  // U
+    0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x24,0x24,0x18,0x18,0x00,0x00,  // V
+    0x42,0x42,0x42,0x42,0x42,0x42,0x5A,0x5A,0x5A,0x5A,0x66,0x66,0x42,0x42,0x00,0x00,  // W
+    0x42,0x42,0x42,0x42,0x24,0x24,0x18,0x18,0x24,0x24,0x42,0x42,0x42,0x42,0x00,0x00,  // X
+    0x44,0x44,0x44,0x44,0x28,0x28,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,  // Y
+    0x7E,0x7E,0x02,0x02,0x04,0x04,0x18,0x18,0x20,0x20,0x40,0x40,0x7E,0x7E,0x00,0x00,  // Z
+    0x7E,0x7E,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0x7E,0x00,0x00,  // [
+    0x00,0x00,0x40,0x40,0x20,0x20,0x10,0x10,0x08,0x08,0x04,0x04,0x02,0x02,0x00,0x00,  // <backslash>
+    0x7E,0x7E,0x06,0x06,0x06,0x06,0x06,0x06,0x06,0x06,0x06,0x06,0x7E,0x7E,0x00,0x00,  // ]
+    0x00,0x00,0x00,0x00,0x10,0x10,0x28,0x28,0x44,0x44,0x00,0x00,0x00,0x00,0x00,0x00,  // ^
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7E,0x7E,0x00,0x00,  // _
+
+    0x20,0x20,0x10,0x10,0x08,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // `
+    0x00,0x00,0x00,0x00,0x3C,0x3C,0x02,0x02,0x3E,0x3E,0x42,0x42,0x3E,0x3E,0x00,0x00,  // a
+    0x40,0x40,0x40,0x40,0x7C,0x7C,0x42,0x42,0x42,0x42,0x42,0x42,0x7C,0x7C,0x00,0x00,  // b
+    0x00,0x00,0x00,0x00,0x3E,0x3E,0x40,0x40,0x40,0x40,0x40,0x40,0x3E,0x3E,0x00,0x00,  // c
+    0x02,0x02,0x02,0x02,0x3E,0x3E,0x42,0x42,0x42,0x42,0x42,0x42,0x3E,0x3E,0x00,0x00,  // d
+    0x00,0x00,0x00,0x00,0x3C,0x3C,0x42,0x42,0x7E,0x7E,0x40,0x40,0x3E,0x3E,0x00,0x00,  // e
+    0x1C,0x1C,0x22,0x22,0x20,0x20,0x7C,0x7C,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,  // f
+    0x00,0x00,0x00,0x00,0x3C,0x3C,0x42,0x42,0x42,0x42,0x3E,0x3E,0x02,0x02,0x3C,0x3C,  // g
+    0x40,0x40,0x40,0x40,0x7C,0x7C,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x00,0x00,  // h
+    0x10,0x10,0x00,0x00,0x30,0x30,0x10,0x10,0x10,0x10,0x10,0x10,0x38,0x38,0x00,0x00,  // i
+    0x04,0x04,0x00,0x00,0x3C,0x3C,0x04,0x04,0x04,0x04,0x04,0x04,0x44,0x44,0x38,0x38,  // j
+    0x40,0x40,0x40,0x40,0x42,0x42,0x44,0x44,0x78,0x78,0x44,0x44,0x42,0x42,0x00,0x00,  // k
+    0x30,0x30,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x38,0x38,0x00,0x00,  // l
+    0x00,0x00,0x00,0x00,0x66,0x66,0x5A,0x5A,0x5A,0x5A,0x5A,0x5A,0x42,0x42,0x00,0x00,  // m
+    0x00,0x00,0x00,0x00,0x7C,0x7C,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x42,0x00,0x00,  // n
+    0x00,0x00,0x00,0x00,0x3C,0x3C,0x42,0x42,0x42,0x42,0x42,0x42,0x3C,0x3C,0x00,0x00,  // o
+
+    0x00,0x00,0x00,0x00,0x7C,0x7C,0x42,0x42,0x42,0x42,0x7C,0x7C,0x40,0x40,0x40,0x40,  // p
+    0x00,0x00,0x00,0x00,0x3E,0x3E,0x42,0x42,0x42,0x42,0x3E,0x3E,0x02,0x02,0x02,0x02,  // q
+    0x00,0x00,0x00,0x00,0x5E,0x5E,0x60,0x60,0x40,0x40,0x40,0x40,0x40,0x40,0x00,0x00,  // r
+    0x00,0x00,0x00,0x00,0x3E,0x3E,0x40,0x40,0x3C,0x3C,0x02,0x02,0x7C,0x7C,0x00,0x00,  // s
+    0x10,0x10,0x10,0x10,0x7C,0x7C,0x10,0x10,0x10,0x10,0x12,0x12,0x0C,0x0C,0x00,0x00,  // t
+    0x00,0x00,0x00,0x00,0x42,0x42,0x42,0x42,0x42,0x42,0x46,0x46,0x3A,0x3A,0x00,0x00,  // u
+    0x00,0x00,0x00,0x00,0x42,0x42,0x42,0x42,0x42,0x42,0x24,0x24,0x18,0x18,0x00,0x00,  // v
+    0x00,0x00,0x00,0x00,0x42,0x42,0x42,0x42,0x5A,0x5A,0x5A,0x5A,0x66,0x66,0x00,0x00,  // w
+    0x00,0x00,0x00,0x00,0x42,0x42,0x24,0x24,0x18,0x18,0x24,0x24,0x42,0x42,0x00,0x00,  // x
+    0x00,0x00,0x00,0x00,0x42,0x42,0x42,0x42,0x42,0x42,0x3E,0x3E,0x02,0x02,0x3C,0x3C,  // y
+    0x00,0x00,0x00,0x00,0x7E,0x7E,0x04,0x04,0x18,0x18,0x20,0x20,0x7E,0x7E,0x00,0x00,  // z
+    0x0E,0x0E,0x18,0x18,0x18,0x18,0x70,0x70,0x18,0x18,0x18,0x18,0x0E,0x0E,0x00,0x00,  // {
+    0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x00,0x00,  // |
+    0x70,0x70,0x18,0x18,0x18,0x18,0x0E,0x0E,0x18,0x18,0x18,0x18,0x70,0x70,0x00,0x00,  // }
+    0x00,0x00,0x00,0x00,0x24,0x24,0x54,0x54,0x48,0x48,0x00,0x00,0x00,0x00,0x00,0x00,  // ~
+];
 
 fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
@@ -179,15 +1802,6 @@ fn main() {
     );
     let _clocks = sc.clock_setup.freeze();
 
-    cortex_m::interrupt::free(|cs| {
-        let mut fb = FB_INFO.borrow(&cs).borrow_mut();
-        fb.clear();
-        fb.write_string("ABRACADABRA!", 0, 0);
-        fb.write_char('A', 0, TEXT_MAX_ROWS - 1);
-        fb.write_char('A', TEXT_MAX_COLS - 1, 0);
-        fb.write_char('A', TEXT_MAX_COLS - 1, TEXT_MAX_ROWS - 1);
-    });
-
     let mut nvic = cp.NVIC;
     nvic.enable(tm4c123x_hal::Interrupt::TIMER0A);
     nvic.enable(tm4c123x_hal::Interrupt::TIMER0B);
@@ -195,6 +1809,14 @@ fn main() {
     enable(sysctl::Domain::Timer0, &mut sc.power_control);
     enable(sysctl::Domain::MicroDma, &mut sc.power_control);
     enable(sysctl::Domain::Ssi2, &mut sc.power_control);
+
+    cortex_m::interrupt::free(|cs| {
+        let mut fb = FB_INFO.borrow(&cs).borrow_mut();
+        fb.write_string("ABRACADABRA!", 0, 0);
+        fb.write_char('A', 0, MAX_Y);
+        fb.write_char('A', MAX_X, 0);
+        fb.write_char('A', MAX_X, MAX_Y);
+    });
 
     let mut portb = p.GPIO_PORTB.split(&sc.power_control);
     let portc = p.GPIO_PORTC.split(&sc.power_control);
@@ -297,36 +1919,41 @@ fn main() {
     });
 }
 
-fn start_of_line(p: &tm4c123x_hal::Peripherals, fb_info: &mut FrameBuffer) {
+fn start_of_line(fb_info: &mut FrameBuffer) {
+    let gpio = unsafe { &*tm4c123x_hal::tm4c123x::GPIO_PORTC::ptr() };
+
     fb_info.line_no += 1;
 
     if fb_info.line_no == V_WHOLE_FRAME {
         fb_info.line_no = 0;
-        unsafe { bb::change_bit(&p.GPIO_PORTC.data, 4, true) };
+        // unsafe { bb::change_bit(&gpio.data, 4, true) };
     }
 
     if fb_info.line_no == V_SYNC_PULSE {
-        unsafe { bb::change_bit(&p.GPIO_PORTC.data, 4, false) };
+        // unsafe { bb::change_bit(&gpio.data, 4, false) };
     }
 
     if (fb_info.line_no >= V_SYNC_PULSE + V_BACK_PORCH)
         && (fb_info.line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
     {
         // Visible lines
-        fb_info.is_visible = true;
         // 600 visible lines, 300 output lines each shown twice
-        fb_info.fb_line = (fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
+        fb_info.fb_line = Some((fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1);
+        unsafe { bb::change_bit(&gpio.data, 4, true) };
+        fb_info.render();
+        unsafe { bb::change_bit(&gpio.data, 4, false) };
     } else {
         // Front porch
-        fb_info.is_visible = false;
+        fb_info.fb_line = None;
     }
 }
 
-fn start_of_data(p: &tm4c123x_hal::Peripherals, fb_info: &FrameBuffer) {
-    if fb_info.is_visible {
-        for word in fb_info.buffer[fb_info.fb_line].iter() {
-            p.SSI2.dr.write(|w| unsafe { w.data().bits(*word) });
-            while p.SSI2.sr.read().tnf().bit_is_clear() {
+fn start_of_data(fb_info: &FrameBuffer) {
+    let ssi = unsafe { &*tm4c123x_hal::tm4c123x::SSI2::ptr() };
+    if fb_info.fb_line.is_some() {
+        for word in fb_info.render_line.iter() {
+            ssi.dr.write(|w| unsafe { w.data().bits(*word) });
+            while ssi.sr.read().tnf().bit_is_clear() {
                 asm::nop();
             }
         }
@@ -334,19 +1961,19 @@ fn start_of_data(p: &tm4c123x_hal::Peripherals, fb_info: &FrameBuffer) {
 }
 
 extern "C" fn timer0a_isr() {
-    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
+    let timer = unsafe { &*tm4c123x_hal::tm4c123x::TIMER0::ptr() };
     let cs = unsafe { CriticalSection::new() };
     let mut fb_info = FB_INFO.borrow(&cs).borrow_mut();
-    start_of_line(&p, &mut fb_info);
-    p.TIMER0.icr.write(|w| w.caecint().set_bit());
+    start_of_line(&mut fb_info);
+    timer.icr.write(|w| w.caecint().set_bit());
 }
 
 extern "C" fn timer0b_isr() {
-    let p = unsafe { tm4c123x_hal::Peripherals::steal() };
+    let timer = unsafe { &*tm4c123x_hal::tm4c123x::TIMER0::ptr() };
     let cs = unsafe { CriticalSection::new() };
     let fb_info = FB_INFO.borrow(&cs).borrow();
-    start_of_data(&p, &fb_info);
-    p.TIMER0.icr.write(|w| w.cbecint().set_bit());
+    start_of_data(&fb_info);
+    timer.icr.write(|w| w.cbecint().set_bit());
 }
 
 extern "C" fn default_handler() {
