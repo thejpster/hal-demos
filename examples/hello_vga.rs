@@ -15,7 +15,7 @@
 //! +    +--------------------------------
 //! --------||||||||||||||||||||||||||||--
 //!
-//! Row timing on WTimer0:
+//! Row timing:
 //! +----+
 //! |SYNC|BP                            FP
 //! +    +--------------------------------
@@ -36,6 +36,7 @@ extern crate embedded_hal;
 extern crate tm4c123x_hal;
 
 use cortex_m::asm;
+use core::ptr;
 use core::cell::RefCell;
 use cortex_m::interrupt::{CriticalSection, Mutex};
 use tm4c123x_hal::gpio::GpioExt;
@@ -137,6 +138,12 @@ impl FrameBuffer {
             }
         }
     }
+
+    fn clear(&mut self) {
+        unsafe {
+            ptr::write_bytes(self.buffer.as_mut_ptr(), 0, VISIBLE_LINES);
+        }
+    }
 }
 
 /// Always gives you captital A
@@ -174,6 +181,7 @@ fn main() {
 
     cortex_m::interrupt::free(|cs| {
         let mut fb = FB_INFO.borrow(&cs).borrow_mut();
+        fb.clear();
         fb.write_string("ABRACADABRA!", 0, 0);
         fb.write_char('A', 0, TEXT_MAX_ROWS - 1);
         fb.write_char('A', TEXT_MAX_COLS - 1, 0);
