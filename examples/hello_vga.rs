@@ -38,6 +38,7 @@ extern crate tm4c123x_hal;
 use cortex_m::asm;
 use tm4c123x_hal::gpio::GpioExt;
 use tm4c123x_hal::sysctl::{self, SysctlExt};
+use tm4c123x_hal::bb;
 
 const H_VISIBLE_AREA: u32 = 800 * 2;
 const H_FRONT_PORCH: u32 = 40 * 2;
@@ -50,20 +51,7 @@ const V_VISIBLE_AREA: u32 = 600;
 const V_FRONT_PORCH: u32 = 1;
 const V_SYNC_PULSE: u32 = 4;
 const V_BACK_PORCH: u32 = 23;
-// Counting down, the sync starts at V_WHOLE_FRAME
-// Then we have the sync pulse, which ends at V_SYNC_END.
-// Then we have the back porch which ends at V_FIRST_LINE
-// Then the data
-// The the front porch ahead of the next sync
-//
-// +----+
-// |SYNC|BP                            FP
-// +    +--------------------------------
-// --------|||||||||||||||||||||||||||--
-
-// Values for the timing system
-const V_WHOLE_FRAME: u32 = (V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
-const V_SYNC_END: u32 = (V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH) as u32;
+const V_WHOLE_FRAME: u32 = V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH;
 
 #[repr(align(1024))]
 struct DmaInfo {
@@ -95,33 +83,40 @@ fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
     let cp = tm4c123x_hal::CorePeripherals::take().unwrap();
 
-    // unsafe {
-    //     for (line_number, line_data) in FRAMEBUFFER.iter_mut().enumerate() {
-    //         if line_number < 100 {
-    //             line_data[0] = 0xFFFF;
-    //         } else if line_number > 200 {
-    //             line_data[0] = 0xFFFF;
-    //         } else {
-    //             line_data[1] = 0xAAAA;
-    //         }
-    //     }
-    //     FRAMEBUFFER[  0][4] = 0b0000000000000000;
-    //     FRAMEBUFFER[  1][4] = 0b0000000000000000;
-    //     FRAMEBUFFER[  2][4] = 0b0000000000000000;
-    //     FRAMEBUFFER[  3][4] = 0b0001000000010000;
-    //     FRAMEBUFFER[  4][4] = 0b0011100000111000;
-    //     FRAMEBUFFER[  5][4] = 0b0110110001101100;
-    //     FRAMEBUFFER[  6][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[  7][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[  8][4] = 0b1111111011111110;
-    //     FRAMEBUFFER[  9][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[ 10][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[ 11][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[ 12][4] = 0b1100011011000110;
-    //     FRAMEBUFFER[ 13][4] = 0b0000000000000000;
-    //     FRAMEBUFFER[ 14][4] = 0b0000000000000000;
-    //     FRAMEBUFFER[ 15][4] = 0b0000000000000000;
-    // }
+    unsafe {
+        FRAMEBUFFER[0][0] = 0b0000000000000000;
+        FRAMEBUFFER[1][0] = 0b0000000000000000;
+        FRAMEBUFFER[2][0] = 0b0000000000000000;
+        FRAMEBUFFER[3][0] = 0b0001000000010000;
+        FRAMEBUFFER[4][0] = 0b0011100000111000;
+        FRAMEBUFFER[5][0] = 0b0110110001101100;
+        FRAMEBUFFER[6][0] = 0b1100011011000110;
+        FRAMEBUFFER[7][0] = 0b1100011011000110;
+        FRAMEBUFFER[8][0] = 0b1111111011111110;
+        FRAMEBUFFER[9][0] = 0b1100011011000110;
+        FRAMEBUFFER[10][0] = 0b1100011011000110;
+        FRAMEBUFFER[11][0] = 0b1100011011000110;
+        FRAMEBUFFER[12][0] = 0b1100011011000110;
+        FRAMEBUFFER[13][0] = 0b0000000000000000;
+        FRAMEBUFFER[14][0] = 0b0000000000000000;
+        FRAMEBUFFER[15][0] = 0b0000000000000000;
+        FRAMEBUFFER[0][24] = 0b0000000000000000;
+        FRAMEBUFFER[1][24] = 0b0000000000000000;
+        FRAMEBUFFER[2][24] = 0b0000000000000000;
+        FRAMEBUFFER[3][24] = 0b0001000000010000;
+        FRAMEBUFFER[4][24] = 0b0011100000111000;
+        FRAMEBUFFER[5][24] = 0b0110110001101100;
+        FRAMEBUFFER[6][24] = 0b1100011011000110;
+        FRAMEBUFFER[7][24] = 0b1100011011000110;
+        FRAMEBUFFER[8][24] = 0b1111111011111110;
+        FRAMEBUFFER[9][24] = 0b1100011011000110;
+        FRAMEBUFFER[10][24] = 0b1100011011000110;
+        FRAMEBUFFER[11][24] = 0b1100011011000110;
+        FRAMEBUFFER[12][24] = 0b1100011011000110;
+        FRAMEBUFFER[13][24] = 0b0000000000000000;
+        FRAMEBUFFER[14][24] = 0b0000000000000000;
+        FRAMEBUFFER[15][24] = 0b0000000000000000;
+    }
 
     let mut sc = p.SYSCTL.constrain();
     sc.clock_setup.oscillator = sysctl::Oscillator::Main(
@@ -135,18 +130,15 @@ fn main() {
     nvic.enable(tm4c123x_hal::Interrupt::TIMER0B);
 
     enable(sysctl::Domain::Timer0, &mut sc.power_control);
-    enable(sysctl::Domain::WideTimer0, &mut sc.power_control);
     enable(sysctl::Domain::MicroDma, &mut sc.power_control);
     enable(sysctl::Domain::Ssi2, &mut sc.power_control);
 
     let mut portb = p.GPIO_PORTB.split(&sc.power_control);
-    let mut portc = p.GPIO_PORTC.split(&sc.power_control);
+    let portc = p.GPIO_PORTC.split(&sc.power_control);
     // T0CCP0
     let _h_sync = portb.pb6.into_af7(&mut portb.control);
-    // T0CCP1 - we use this for checking line pixel start (i.e. sync + back porch)
-    // let _h_timer = portb.pb7.into_af7(&mut portb.control);
-    // WT0CCP0
-    let _v_sync = portc.pc4.into_af7(&mut portc.control);
+    // GPIO controlled V-Sync
+    let _v_sync = portc.pc4.into_push_pull_output();
     // Ssi2Tx
     let _green_data = portb.pb7.into_af2(&mut portb.control);
 
@@ -222,46 +214,24 @@ fn main() {
     h_timer
         .tbmatchr
         .modify(|_, w| unsafe { w.bits(H_LINE_START - 1) });
-    // TODO IMR.TBMIM = 1 (for line start)
-    // TODO IMR.TBTOIM = 1 (for row count)
     h_timer.imr.modify(|_, w| {
         w.caeim().set_bit(); // Timer0A fires at start of line
-        w.cbeim().set_bit(); // Timer0B is start of data
+        w.cbeim().set_bit(); // Timer0B fires at start of data
         w
     });
-
-    // Configure WT0 for v-sync in 32-bit mode
-    let v_timer = p.WTIMER0;
-    v_timer
-        .ctl
-        .modify(|_, w| w.taen().clear_bit().tben().clear_bit());
-    v_timer.cfg.modify(|_, w| w.cfg()._16_bit());
-    v_timer.tamr.modify(|_, w| {
-        w.taams().set_bit();
-        w.tacmr().clear_bit();
-        w.tamr().period();
-        w.tawot().set_bit();
-        w
-    });
-    v_timer.ctl.modify(|_, w| w.tapwml().clear_bit());
-    v_timer.tapr.modify(|_, w| unsafe { w.bits(0) });
-    // We're counting down in PWM mode, so start at the end
-    v_timer
-        .tailr
-        .modify(|_, w| unsafe { w.bits(V_WHOLE_FRAME * H_WHOLE_LINE - 1) });
-    v_timer
-        .tamatchr
-        .modify(|_, w| unsafe { w.bits(V_SYNC_END * H_WHOLE_LINE - 1) });
 
     // Clear interrupts
-    h_timer
-        .icr
-        .write(|w| w.tbmcint().set_bit().tbtocint().set_bit());
+    h_timer.icr.write(|w| {
+        w.tbmcint().set_bit();
+        w.tbtocint().set_bit();
+        w
+    });
 
-    v_timer.ctl.modify(|_, w| w.taen().set_bit());
-    h_timer
-        .ctl
-        .modify(|_, w| w.taen().set_bit().tben().set_bit());
+    h_timer.ctl.modify(|_, w| {
+        w.taen().set_bit();
+        w.tben().set_bit();
+        w
+    });
 }
 
 extern "C" fn timer0a_isr() {
@@ -270,22 +240,28 @@ extern "C" fn timer0a_isr() {
     // Increment line number
     unsafe {
         let mut line_no = LINE_NUMBER + 1;
+
         if line_no == V_WHOLE_FRAME {
             line_no = 0;
+            bb::change_bit(&p.GPIO_PORTC.data, 4, true);
         }
-        if line_no < V_SYNC_PULSE {
-            // Sync pulse
-        } else if line_no < V_SYNC_PULSE + V_BACK_PORCH {
-            // Back porch
-            IS_VISIBLE = false;
-        } else if line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA {
+
+        if line_no == V_SYNC_PULSE {
+            bb::change_bit(&p.GPIO_PORTC.data, 4, false);
+        }
+
+        if (line_no >= V_SYNC_PULSE + V_BACK_PORCH)
+            && (line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
+        {
             // Visible lines
             IS_VISIBLE = true;
+            // 600 visible lines, 300 output lines each shown twice
             FB_LINE = (line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1;
         } else {
             // Front porch
             IS_VISIBLE = false;
         }
+
         LINE_NUMBER = line_no;
     }
 }
