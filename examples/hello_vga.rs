@@ -54,30 +54,47 @@ const V_FRONT_PORCH: usize = 1;
 const V_SYNC_PULSE: usize = 4;
 const V_BACK_PORCH: usize = 23;
 const V_WHOLE_FRAME: usize = V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH;
+
+/// Text characters are this many pixels across
+const FONT_WIDTH: usize = 8;
+/// Text characters are this many pixels high
+const FONT_HEIGHT: usize = 16;
 /// Number of lines in frame buffer
 const VISIBLE_LINES: usize = 300;
+/// Number of columns in frame buffer
+const VISIBLE_COLS: usize = 400;
+/// How many 16-bit words in a line
+const HORIZONTAL_WORDS: usize = (VISIBLE_COLS + 15) / 16;
+/// How many characters in a line
+const TEXT_MAX_COLS: usize = VISIBLE_COLS / FONT_WIDTH;
+/// How many lines of characters on the screen
+const TEXT_MAX_ROWS: usize = VISIBLE_LINES / FONT_HEIGHT;
 
 #[repr(align(1024))]
 struct DmaInfo {
     _data: [u8; 1024],
 }
 
-struct FbInfo {
+struct FrameBuffer {
     line_no: usize,
     is_visible: bool,
     fb_line: usize,
+    buffer: [[u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
+    // text: [[u8; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
 }
 
 /// Required by the DMA engine
 #[used]
 static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
 /// Mono framebuffer, arranged in lines.
-static mut FRAMEBUFFER: [[u16; 25]; VISIBLE_LINES] = include!("rust_logo.inc");
 
-static FB_INFO: Mutex<RefCell<FbInfo>> = Mutex::new(RefCell::new(FbInfo {
+static FB_INFO: Mutex<RefCell<FrameBuffer>> = Mutex::new(RefCell::new(FrameBuffer {
     line_no: 0,
     is_visible: false,
     fb_line: 0,
+    /// Arranged as lines of 25 u16 words (= 400 pixels)
+    buffer: [[0u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
+    // text: [[0u8; TEXT_MAX_COLS]; TEXT_MAX_ROWS],
 }));
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
@@ -86,44 +103,67 @@ fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
     sysctl::reset(sc, p);
 }
 
+impl FrameBuffer {
+    /// Render a character to the frame buffer.
+    fn write_char(&mut self, ch: char, x: usize, y: usize) {
+        if (x < TEXT_MAX_COLS) && (y < TEXT_MAX_ROWS) {
+            let odd = (x & 1) == 1;
+            let word = x / 2;
+            for row in 0..FONT_HEIGHT {
+                let line = ((y * FONT_HEIGHT) + row) % VISIBLE_LINES;
+                let mut d = self.buffer[line][word];
+                if odd {
+                    d &= 0xFF00;
+                    d |= font_lookup(ch, row) as u16;
+                } else {
+                    d &= 0x00FF;
+                    d |= (font_lookup(ch, row) as u16) << 8;
+                }
+                self.buffer[line][word] = d;
+            }
+        }
+    }
+
+    fn write_string(&mut self, message: &str, mut x: usize, mut y: usize) {
+        for ch in message.chars() {
+            self.write_char(ch, x, y);
+            x += 1;
+            if x >= TEXT_MAX_COLS {
+                y += 1;
+                x = 0;
+            }
+            if y >= TEXT_MAX_ROWS {
+                y = 0;
+            }
+        }
+    }
+}
+
+/// Always gives you captital A
+fn font_lookup(ch: char, row: usize) -> u8 {
+    match ch {
+        'A' => match row {
+            3 => 0b00010000,
+            4 => 0b00111000,
+            5 => 0b01101100,
+            6 => 0b11000110,
+            7 => 0b11000110,
+            8 => 0b11111110,
+            9 => 0b11000110,
+            10 => 0b11000110,
+            11 => 0b11000110,
+            12 => 0b11000110,
+            _ => 0b00000000,
+        },
+        _ => match row {
+            _ => 0b11111111,
+        },
+    }
+}
+
 fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
     let cp = tm4c123x_hal::CorePeripherals::take().unwrap();
-
-    unsafe {
-        FRAMEBUFFER[0][0] = 0b0000000000000000;
-        FRAMEBUFFER[1][0] = 0b0000000000000000;
-        FRAMEBUFFER[2][0] = 0b0000000000000000;
-        FRAMEBUFFER[3][0] = 0b0001000000010000;
-        FRAMEBUFFER[4][0] = 0b0011100000111000;
-        FRAMEBUFFER[5][0] = 0b0110110001101100;
-        FRAMEBUFFER[6][0] = 0b1100011011000110;
-        FRAMEBUFFER[7][0] = 0b1100011011000110;
-        FRAMEBUFFER[8][0] = 0b1111111011111110;
-        FRAMEBUFFER[9][0] = 0b1100011011000110;
-        FRAMEBUFFER[10][0] = 0b1100011011000110;
-        FRAMEBUFFER[11][0] = 0b1100011011000110;
-        FRAMEBUFFER[12][0] = 0b1100011011000110;
-        FRAMEBUFFER[13][0] = 0b0000000000000000;
-        FRAMEBUFFER[14][0] = 0b0000000000000000;
-        FRAMEBUFFER[15][0] = 0b0000000000000000;
-        FRAMEBUFFER[0][24] = 0b0000000000000000;
-        FRAMEBUFFER[1][24] = 0b0000000000000000;
-        FRAMEBUFFER[2][24] = 0b0000000000000000;
-        FRAMEBUFFER[3][24] = 0b0001000000010000;
-        FRAMEBUFFER[4][24] = 0b0011100000111000;
-        FRAMEBUFFER[5][24] = 0b0110110001101100;
-        FRAMEBUFFER[6][24] = 0b1100011011000110;
-        FRAMEBUFFER[7][24] = 0b1100011011000110;
-        FRAMEBUFFER[8][24] = 0b1111111011111110;
-        FRAMEBUFFER[9][24] = 0b1100011011000110;
-        FRAMEBUFFER[10][24] = 0b1100011011000110;
-        FRAMEBUFFER[11][24] = 0b1100011011000110;
-        FRAMEBUFFER[12][24] = 0b1100011011000110;
-        FRAMEBUFFER[13][24] = 0b0000000000000000;
-        FRAMEBUFFER[14][24] = 0b0000000000000000;
-        FRAMEBUFFER[15][24] = 0b0000000000000000;
-    }
 
     let mut sc = p.SYSCTL.constrain();
     sc.clock_setup.oscillator = sysctl::Oscillator::Main(
@@ -131,6 +171,14 @@ fn main() {
         sysctl::SystemClock::UsePll(sysctl::PllOutputFrequency::_80_00mhz),
     );
     let _clocks = sc.clock_setup.freeze();
+
+    cortex_m::interrupt::free(|cs| {
+        let mut fb = FB_INFO.borrow(&cs).borrow_mut();
+        fb.write_string("ABRACADABRA!", 0, 0);
+        fb.write_char('A', 0, TEXT_MAX_ROWS - 1);
+        fb.write_char('A', TEXT_MAX_COLS - 1, 0);
+        fb.write_char('A', TEXT_MAX_COLS - 1, TEXT_MAX_ROWS - 1);
+    });
 
     let mut nvic = cp.NVIC;
     nvic.enable(tm4c123x_hal::Interrupt::TIMER0A);
@@ -179,10 +227,12 @@ fn main() {
         .write(|w| unsafe { w.addr().bits(&mut DMA_CONTROL_TABLE as *mut DmaInfo as u32) });
 
     let h_timer = p.TIMER0;
-    // Configure h_timerA for h-sync and h_timerB for line trigger
-    h_timer
-        .ctl
-        .modify(|_, w| w.taen().clear_bit().tben().clear_bit());
+    // Configure Timer0A for h-sync and Timer0B for line trigger
+    h_timer.ctl.modify(|_, w| {
+        w.taen().clear_bit();
+        w.tben().clear_bit();
+        w
+    });
     h_timer.cfg.modify(|_, w| w.cfg()._16_bit());
     h_timer.tamr.modify(|_, w| {
         w.taams().set_bit();
@@ -206,8 +256,6 @@ fn main() {
         w.tbpwml().set_bit();
         w
     });
-    h_timer.tapr.modify(|_, w| unsafe { w.bits(0) });
-    h_timer.tbpr.modify(|_, w| unsafe { w.bits(0) });
     // We're counting down in PWM mode, so start at the end
     h_timer
         .tailr
@@ -241,7 +289,7 @@ fn main() {
     });
 }
 
-fn start_of_line(p: &tm4c123x_hal::Peripherals, fb_info: &mut FbInfo) {
+fn start_of_line(p: &tm4c123x_hal::Peripherals, fb_info: &mut FrameBuffer) {
     fb_info.line_no += 1;
 
     if fb_info.line_no == V_WHOLE_FRAME {
@@ -266,10 +314,9 @@ fn start_of_line(p: &tm4c123x_hal::Peripherals, fb_info: &mut FbInfo) {
     }
 }
 
-fn start_of_data(p: &tm4c123x_hal::Peripherals, fb_info: &FbInfo) {
+fn start_of_data(p: &tm4c123x_hal::Peripherals, fb_info: &FrameBuffer) {
     if fb_info.is_visible {
-        let iter = unsafe { FRAMEBUFFER[fb_info.fb_line].iter() };
-        for word in iter {
+        for word in fb_info.buffer[fb_info.fb_line].iter() {
             p.SSI2.dr.write(|w| unsafe { w.data().bits(*word) });
             while p.SSI2.sr.read().tnf().bit_is_clear() {
                 asm::nop();
