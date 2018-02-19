@@ -29,19 +29,19 @@
 #![feature(used)]
 #![no_std]
 
+extern crate bresenham;
 extern crate cortex_m;
 extern crate cortex_m_rt;
 extern crate cortex_m_semihosting;
 extern crate embedded_hal;
 extern crate tm4c123x_hal;
-extern crate bresenham;
 
 use cortex_m::asm;
 use core::fmt::Write;
 use embedded_hal::prelude::*;
 use tm4c123x_hal::gpio::GpioExt;
 use tm4c123x_hal::delay::Delay;
-use tm4c123x_hal::sysctl::{self, SysctlExt};
+use tm4c123x_hal::sysctl::{self, chip_id, SysctlExt};
 use tm4c123x_hal::bb;
 
 const H_VISIBLE_AREA: u32 = 800 * 2;
@@ -295,13 +295,14 @@ const FONT_DATA: [u8; 1536] = [
 struct FrameBuffer {
     line_no: usize,
     fb_line: Option<usize>,
+    frame: usize,
     buffer: [[u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
 }
 
 struct Cursor<'a> {
-    x: usize,
-    y: usize,
-    fb: &'a mut FrameBuffer
+    col: usize,
+    row: usize,
+    fb: &'a mut FrameBuffer,
 }
 
 /// Required by the DMA engine
@@ -312,6 +313,7 @@ struct Cursor<'a> {
 static mut FRAMEBUFFER: FrameBuffer = FrameBuffer {
     line_no: 0,
     fb_line: None,
+    frame: 0,
     buffer: [[0xFFFFu16; HORIZONTAL_WORDS]; VISIBLE_LINES],
 };
 
@@ -323,23 +325,35 @@ fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
 
 impl FrameBuffer {
     /// Write a character to the text buffer.
-    fn write_char(&mut self, ch: char, x: usize, y: usize) {
-        if (x < TEXT_NUM_COLS) && (y < TEXT_NUM_ROWS) {
-            let pixel_x = x * FONT_WIDTH;
-            let pixel_y = y * FONT_HEIGHT;
+    ///
+    /// `col` and `row` are in character cell co-ordinates. `col` is
+    /// `[0..TEXT_MAX_COL]` and `row` is `[0..TEXT_MAX_ROWS]`.
+    ///
+    /// `ch` is a unicode code-point. It will be mapped to a supported glyph,
+    /// or to the special `Glyph::Unknown` glyph.
+    ///
+    /// If `flip` is `true`, text will be rendered black on green, otherwise
+    /// the normal green on black.
+    fn write_char(&mut self, ch: char, col: usize, row: usize, flip: bool) {
+        if (col < TEXT_NUM_COLS) && (row < TEXT_NUM_ROWS) {
+            let pixel_x = col * FONT_WIDTH;
+            let pixel_y = row * FONT_HEIGHT;
             let word_x = pixel_x / 16;
             let glyph = Self::map_char(ch);
             for row in 0..FONT_HEIGHT {
-                let font_byte = Self::font_lookup(glyph, row) as u16;
+                let mut font_byte = Self::font_lookup(glyph, row);
+                if flip {
+                    font_byte = !font_byte;
+                }
                 let mut bits = self.buffer[pixel_y + row][word_x];
-                if (x & 1) == 1 {
-                    // Odd byte
+                if (col & 1) == 1 {
+                    // second u8 in u16
                     bits &= 0xFF00;
-                    bits |= font_byte;
+                    bits |= font_byte as u16;
                 } else {
-                    // Even byte
+                    // first u8 in u16
                     bits &= 0x00FF;
-                    bits |= font_byte << 8;
+                    bits |= (font_byte as u16) << 8;
                 }
                 self.buffer[pixel_y + row][word_x] = bits;
             }
@@ -348,16 +362,22 @@ impl FrameBuffer {
 
     /// Write a string to the text buffer. Wraps off the end of the screen
     /// automatically.
-    fn write_string(&mut self, message: &str, mut x: usize, mut y: usize) {
+    ///
+    /// `x` and `y` are in character cell co-ordinates. `x` is
+    /// `[0..TEXT_MAX_COL]` and `y` is `[0..TEXT_MAX_ROWS]`.
+    ///
+    /// If `flip` is `true`, text will be rendered black on green, otherwise
+    /// the normal green on black.
+    fn write_string(&mut self, message: &str, mut col: usize, mut row: usize, flip: bool) {
         for ch in message.chars() {
-            self.write_char(ch, x, y);
-            x += 1;
-            if x >= TEXT_NUM_COLS {
-                y += 1;
-                x = 0;
+            self.write_char(ch, col, row, flip);
+            col += 1;
+            if col >= TEXT_NUM_COLS {
+                row += 1;
+                col = 0;
             }
-            if y >= TEXT_NUM_ROWS {
-                y = 0;
+            if row >= TEXT_NUM_ROWS {
+                row = 0;
             }
         }
     }
@@ -470,9 +490,12 @@ impl FrameBuffer {
         FONT_DATA[index]
     }
 
+    /// Plot a point on screen.
     fn draw_point(&mut self, pos: Point, set: bool) {
         if pos.0 < VISIBLE_COLS && pos.1 < VISIBLE_LINES {
-            unsafe { self.point(pos.0, pos.1, set); }
+            unsafe {
+                self.point(pos.0, pos.1, set);
+            }
         }
     }
 
@@ -486,6 +509,7 @@ impl FrameBuffer {
         }
     }
 
+    /// Draw a box using lines. The box is hollow, not filled.
     fn hollow_rectangle(&mut self, top_left: Point, bottom_right: Point, set: bool) {
         let top_right = Point(bottom_right.0, top_left.1);
         let bottom_left = Point(top_left.0, bottom_right.1);
@@ -495,19 +519,23 @@ impl FrameBuffer {
         self.line(bottom_left, top_left, set);
     }
 
+    /// Draw a line.
     fn line(&mut self, mut start: Point, mut end: Point, set: bool) {
         start.0 = start.0.min(MAX_X);
         start.1 = start.1.min(MAX_Y);
         end.0 = end.0.min(MAX_X);
         end.1 = end.1.min(MAX_Y);
-        for (x, y) in bresenham::Bresenham::new((start.0 as isize, start.1 as isize), (end.0 as isize, end.1 as isize)) {
+        for (x, y) in bresenham::Bresenham::new(
+            (start.0 as isize, start.1 as isize),
+            (end.0 as isize, end.1 as isize),
+        ) {
             unsafe { self.point(x as usize, y as usize, set) }
         }
     }
 
-    fn clear(&mut self, set: bool) {
+    fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(self.buffer.as_mut_ptr(), if set { 0xFF } else { 0x00 }, VISIBLE_LINES);
+            core::ptr::write_bytes(self.buffer.as_mut_ptr(), 0x00, VISIBLE_LINES);
         }
     }
 }
@@ -639,45 +667,75 @@ fn main() {
 
     // Give the monitor time to auto-sync with a full green screen
     d.delay_ms(4000u32);
+    let mut c = Cursor::new(unsafe { &mut FRAMEBUFFER });
 
     // Clear the framebuffer
     unsafe {
-        FRAMEBUFFER.clear(false);
+        FRAMEBUFFER.clear();
         for row in 0..TEXT_NUM_ROWS {
-            FRAMEBUFFER.write_char('$', 0, row);
-            FRAMEBUFFER.write_char('$', TEXT_MAX_COL, row);
+            FRAMEBUFFER.write_char('$', 0, row, true);
+            FRAMEBUFFER.write_char('$', TEXT_MAX_COL, row, true);
         }
-        FRAMEBUFFER.write_string("Hello, Twitters.", 5, 1);
-        FRAMEBUFFER.write_string("Now we have a font renderer too.", 5, 0);
-        FRAMEBUFFER.write_string("-- @therealjpster", 5, 3);
         FRAMEBUFFER.line(Point(0, 0), Point(MAX_X, MAX_Y), true);
         FRAMEBUFFER.hollow_rectangle(Point(50, 50), Point(350, 250), true);
     }
 
+    writeln!(c, "Hello, Twitters.\nNow we have a font renderer too!").unwrap();
+    writeln!(c, "\n-- @therealjpster").unwrap();
+    //    writeln!(c, "Chip ID: {:?}", chip_id::get()).unwrap();
+    writeln!(c, "X\tY").unwrap();
+    writeln!(c, "ABC\t123").unwrap();
+    writeln!(c, "DEF\t£4.0").unwrap();
+    let mut old = 0;
     loop {
-        let mut c = Cursor {
-            x: 5,
-            y: 5,
-            fb: unsafe { &mut FRAMEBUFFER }
-        };
-        write!(c, "Loop {}", i).unwrap();
-        i = i + 1;
-        d.delay_ms(1000u32);
+        asm::wfi();
+        let new = unsafe { FRAMEBUFFER.frame };
+        if new != old {
+            old = new;
+            write!(c, "\nLoop {}", i).unwrap();
+            i = i + 1;
+        }
     }
+}
 
+impl<'a> Cursor<'a> {
+    fn new(fb: &'a mut FrameBuffer) -> Cursor<'a> {
+        Cursor { col: 0, row: 0, fb }
+    }
 }
 
 impl<'a> core::fmt::Write for Cursor<'a> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for ch in s.chars() {
-            self.fb.write_char(ch, self.x, self.y);
-            self.x += 1;
-            if self.x == TEXT_NUM_ROWS {
-                self.x = 0;
-                self.y += 1;
-                if self.y == TEXT_NUM_COLS {
-                    // Should really scroll screen here...
-                    self.y = 0;
+            match ch {
+                '\n' => {
+                    self.col = 0;
+                    self.row += 1;
+                }
+                '\r' => {
+                    self.col = 0;
+                }
+                '\t' => {
+                    let tabs = self.col / 9;
+                    self.col = (tabs + 1) * 9;
+                }
+                ch => {
+                    self.fb.write_char(ch, self.col, self.row, false);
+                    self.col += 1;
+                }
+            }
+            if self.col == TEXT_NUM_COLS {
+                self.col = 0;
+                self.row += 1;
+            }
+            if self.row == TEXT_NUM_ROWS {
+                // Should really scroll screen here...
+                self.row = TEXT_NUM_ROWS - 1;
+                for line in 0..VISIBLE_LINES-FONT_HEIGHT {
+                    self.fb.buffer[line] = self.fb.buffer[line + FONT_HEIGHT];
+                }
+                for line in VISIBLE_LINES-FONT_HEIGHT..VISIBLE_LINES {
+                    self.fb.buffer[line] = [0u16; HORIZONTAL_WORDS];
                 }
             }
         }
@@ -705,6 +763,8 @@ fn start_of_line(fb_info: &mut FrameBuffer) {
         // Visible lines
         // 600 visible lines, 300 output lines each shown twice
         fb_info.fb_line = Some((fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1);
+    } else if fb_info.line_no == V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA {
+        fb_info.frame = fb_info.frame.wrapping_add(1);
     } else {
         // Front porch
         fb_info.fb_line = None;
