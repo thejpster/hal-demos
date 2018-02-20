@@ -731,10 +731,10 @@ impl<'a> core::fmt::Write for Cursor<'a> {
             if self.row == TEXT_NUM_ROWS {
                 // Should really scroll screen here...
                 self.row = TEXT_NUM_ROWS - 1;
-                for line in 0..VISIBLE_LINES-FONT_HEIGHT {
+                for line in 0..VISIBLE_LINES - FONT_HEIGHT {
                     self.fb.buffer[line] = self.fb.buffer[line + FONT_HEIGHT];
                 }
-                for line in VISIBLE_LINES-FONT_HEIGHT..VISIBLE_LINES {
+                for line in VISIBLE_LINES - FONT_HEIGHT..VISIBLE_LINES {
                     self.fb.buffer[line] = [0u16; HORIZONTAL_WORDS];
                 }
             }

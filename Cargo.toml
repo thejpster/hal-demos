@@ -19,13 +19,16 @@ keywords = ["arm", "cortex-m", "template"]
 categories = ["embedded", "no-std"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/japaric/cortex-m-quickstart"
+
 [profile.dev]
 codegen-units = 1
 incremental = false
+panic = "abort"
 
 [profile.release]
 lto = true
 debug = true
+panic = "abort"
 
 [dependencies]
 tm4c123x-hal = { path = "../tm4c123x-hal" }
