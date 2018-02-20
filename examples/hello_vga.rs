@@ -682,7 +682,7 @@ fn main() {
 
     writeln!(c, "Hello, Twitters.\nNow we have a font renderer too!").unwrap();
     writeln!(c, "\n-- @therealjpster").unwrap();
-    //    writeln!(c, "Chip ID: {:?}", chip_id::get()).unwrap();
+    writeln!(c, "Chip ID: {:?}", chip_id::get()).unwrap();
     writeln!(c, "X\tY").unwrap();
     writeln!(c, "ABC\t123").unwrap();
     writeln!(c, "DEF\t£4.0").unwrap();
@@ -692,7 +692,7 @@ fn main() {
         let new = unsafe { FRAMEBUFFER.frame };
         if new != old {
             old = new;
-            write!(c, "\nLoop {}", i).unwrap();
+            write!(c, "\rLoop {}", i).unwrap();
             i = i + 1;
         }
     }
