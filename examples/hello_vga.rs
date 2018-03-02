@@ -35,51 +35,77 @@ extern crate cortex_m_rt;
 extern crate cortex_m_semihosting;
 extern crate embedded_hal;
 extern crate tm4c123x_hal;
+extern crate menu;
+extern crate vga_framebuffer;
 
-use cortex_m::asm;
+use menu::*;
+
 use core::fmt::Write;
+use cortex_m::asm;
 use embedded_hal::prelude::*;
-use tm4c123x_hal::gpio::GpioExt;
-use tm4c123x_hal::delay::Delay;
-use tm4c123x_hal::sysctl::{self, chip_id, SysctlExt};
 use tm4c123x_hal::bb;
+use tm4c123x_hal::delay::Delay;
+use tm4c123x_hal::gpio::GpioExt;
+use tm4c123x_hal::serial::{NewlineMode, Serial};
+use tm4c123x_hal::sysctl::{self, SysctlExt};
+use tm4c123x_hal::time::U32Ext;
 
-const H_VISIBLE_AREA: u32 = 800 * 2;
-const H_FRONT_PORCH: u32 = 40 * 2;
-const H_SYNC_PULSE: u32 = 128 * 2;
-const H_BACK_PORCH: u32 = 88 * 2;
-const H_WHOLE_LINE: u32 = H_VISIBLE_AREA + H_FRONT_PORCH + H_SYNC_PULSE + H_BACK_PORCH;
-const H_SYNC_END: u32 = (H_WHOLE_LINE - H_SYNC_PULSE);
-const ISR_LATENCY: u32 = 44;
-const H_LINE_START: u32 = H_WHOLE_LINE - (H_SYNC_PULSE + H_BACK_PORCH) + ISR_LATENCY;
-const V_VISIBLE_AREA: usize = 600;
-const V_FRONT_PORCH: usize = 1;
-const V_SYNC_PULSE: usize = 4;
-const V_BACK_PORCH: usize = 23;
-const V_WHOLE_FRAME: usize = V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA + V_FRONT_PORCH;
-
-/// Text characters are this many pixels across
-pub const FONT_WIDTH: usize = 8;
-/// Text characters are this many pixels high
-pub const FONT_HEIGHT: usize = 16;
-/// Number of lines in frame buffer
-pub const VISIBLE_LINES: usize = 300;
-/// Highest Y co-ord
-pub const MAX_Y: usize = VISIBLE_LINES - 1;
-/// Number of columns in frame buffer
-pub const VISIBLE_COLS: usize = 400;
-/// Highest X co-ord
-pub const MAX_X: usize = VISIBLE_COLS - 1;
-/// How many 16-bit words in a line
-pub const HORIZONTAL_WORDS: usize = (VISIBLE_COLS + 15) / 16;
 /// How many characters in a line
-pub const TEXT_NUM_COLS: usize = VISIBLE_COLS / FONT_WIDTH;
+pub const TEXT_NUM_COLS: usize = vga_framebuffer::VISIBLE_COLS / FONT_WIDTH;
 /// Highest X co-ord for text
 pub const TEXT_MAX_COL: usize = TEXT_NUM_COLS - 1;
 /// How many lines of characters on the screen
-pub const TEXT_NUM_ROWS: usize = VISIBLE_LINES / FONT_HEIGHT;
+pub const TEXT_NUM_ROWS: usize = vga_framebuffer::VISIBLE_LINES / FONT_HEIGHT;
 /// Highest Y co-ord for text
 pub const TEXT_MAX_ROW: usize = TEXT_NUM_ROWS - 1;
+
+fn dummy_callback<'a>(_menu: &Menu, _item: &Item, _input: &str) {
+
+}
+
+const FOO_ITEM: Item = Item {
+    item_type: ItemType::Callback(dummy_callback),
+    command: "foo",
+    help: Some("makes a foo appear"),
+};
+
+const BAR_ITEM: Item = Item {
+    item_type: ItemType::Callback(dummy_callback),
+    command: "bar",
+    help: Some("fandoggles a bar"),
+};
+
+const ENTER_ITEM: Item = Item {
+    item_type: ItemType::Menu(&SUB_MENU),
+    command: "sub",
+    help: Some("enter sub-menu"),
+};
+
+const ROOT_MENU: Menu = Menu {
+    label: "root",
+    items: &[&FOO_ITEM, &BAR_ITEM, &ENTER_ITEM],
+    entry: None,
+    exit: None,
+};
+
+const BAZ_ITEM: Item = Item {
+    item_type: ItemType::Callback(dummy_callback),
+    command: "baz",
+    help: Some("thingamobob a baz"),
+};
+
+const QUUX_ITEM: Item = Item {
+    item_type: ItemType::Callback(dummy_callback),
+    command: "quux",
+    help: Some("maximum quux"),
+};
+
+const SUB_MENU: Menu = Menu {
+    label: "sub",
+    items: &[&BAZ_ITEM, &QUUX_ITEM],
+    entry: None,
+    exit: None,
+};
 
 // #[repr(align(1024))]
 // struct DmaInfo {
@@ -188,6 +214,9 @@ enum Glyph {
     Tilde,
 }
 
+const FONT_WIDTH: usize = 8;
+const FONT_HEIGHT: usize = 16;
+
 const FONT_DATA: [u8; 1536] = [
     0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,  // <unknown>
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // <space>
@@ -292,17 +321,17 @@ const FONT_DATA: [u8; 1536] = [
     0x00,0x00,0x00,0x00,0x24,0x24,0x54,0x54,0x48,0x48,0x00,0x00,0x00,0x00,0x00,0x00,  // ~
 ];
 
-struct FrameBuffer {
-    line_no: usize,
-    fb_line: Option<usize>,
-    frame: usize,
-    buffer: [[u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
-}
+// struct FrameBuffer {
+//     line_no: usize,
+//     fb_line: Option<usize>,
+//     frame: usize,
+//     buffer: [[u16; HORIZONTAL_WORDS]; VISIBLE_LINES],
+// }
 
-struct Cursor<'a> {
+struct Cursor<'a, T> where T: vga_framebuffer::Hardware, T: 'a {
     col: usize,
     row: usize,
-    fb: &'a mut FrameBuffer,
+    fb: &'a mut vga_framebuffer::FrameBuffer<T>,
 }
 
 /// Required by the DMA engine
@@ -310,11 +339,20 @@ struct Cursor<'a> {
 // static mut DMA_CONTROL_TABLE: DmaInfo = DmaInfo { _data: [0u8; 1024] };
 
 /// Mono framebuffer, arranged in lines.
-static mut FRAMEBUFFER: FrameBuffer = FrameBuffer {
-    line_no: 0,
-    fb_line: None,
-    frame: 0,
-    buffer: [[0xFFFFu16; HORIZONTAL_WORDS]; VISIBLE_LINES],
+// static mut FRAMEBUFFER: FrameBuffer = FrameBuffer {
+//     line_no: 0,
+//     fb_line: None,
+//     frame: 0,
+//     buffer: [[0xFFFFu16; HORIZONTAL_WORDS]; VISIBLE_LINES],
+// };
+static mut FRAMEBUFFER: vga_framebuffer::FrameBuffer<&'static mut Hardware> = vga_framebuffer::FrameBuffer::new();
+
+struct Hardware {
+    h_timer: Option<tm4c123x_hal::tm4c123x::TIMER0>,
+}
+
+static mut HARDWARE: Hardware = Hardware {
+    h_timer: None
 };
 
 fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
@@ -323,225 +361,225 @@ fn enable(p: sysctl::Domain, sc: &mut tm4c123x_hal::sysctl::PowerControl) {
     sysctl::reset(sc, p);
 }
 
-impl FrameBuffer {
-    /// Write a character to the text buffer.
-    ///
-    /// `col` and `row` are in character cell co-ordinates. `col` is
-    /// `[0..TEXT_MAX_COL]` and `row` is `[0..TEXT_MAX_ROWS]`.
-    ///
-    /// `ch` is a unicode code-point. It will be mapped to a supported glyph,
-    /// or to the special `Glyph::Unknown` glyph.
-    ///
-    /// If `flip` is `true`, text will be rendered black on green, otherwise
-    /// the normal green on black.
-    fn write_char(&mut self, ch: char, col: usize, row: usize, flip: bool) {
-        if (col < TEXT_NUM_COLS) && (row < TEXT_NUM_ROWS) {
-            let pixel_x = col * FONT_WIDTH;
-            let pixel_y = row * FONT_HEIGHT;
-            let word_x = pixel_x / 16;
-            let glyph = Self::map_char(ch);
-            for row in 0..FONT_HEIGHT {
-                let mut font_byte = Self::font_lookup(glyph, row);
-                if flip {
-                    font_byte = !font_byte;
-                }
-                let mut bits = self.buffer[pixel_y + row][word_x];
-                if (col & 1) == 1 {
-                    // second u8 in u16
-                    bits &= 0xFF00;
-                    bits |= font_byte as u16;
-                } else {
-                    // first u8 in u16
-                    bits &= 0x00FF;
-                    bits |= (font_byte as u16) << 8;
-                }
-                self.buffer[pixel_y + row][word_x] = bits;
-            }
-        }
-    }
+// impl FrameBuffer {
+//     /// Write a character to the text buffer.
+//     ///
+//     /// `col` and `row` are in character cell co-ordinates. `col` is
+//     /// `[0..TEXT_MAX_COL]` and `row` is `[0..TEXT_MAX_ROWS]`.
+//     ///
+//     /// `ch` is a unicode code-point. It will be mapped to a supported glyph,
+//     /// or to the special `Glyph::Unknown` glyph.
+//     ///
+//     /// If `flip` is `true`, text will be rendered black on green, otherwise
+//     /// the normal green on black.
+//     fn write_char(&mut self, ch: char, col: usize, row: usize, flip: bool) {
+//         if (col < TEXT_NUM_COLS) && (row < TEXT_NUM_ROWS) {
+//             let pixel_x = col * FONT_WIDTH;
+//             let pixel_y = row * FONT_HEIGHT;
+//             let word_x = pixel_x / 16;
+//             let glyph = Self::map_char(ch);
+//             for row in 0..FONT_HEIGHT {
+//                 let mut font_byte = Self::font_lookup(glyph, row);
+//                 if flip {
+//                     font_byte = !font_byte;
+//                 }
+//                 let mut bits = self.buffer[pixel_y + row][word_x];
+//                 if (col & 1) == 1 {
+//                     // second u8 in u16
+//                     bits &= 0xFF00;
+//                     bits |= font_byte as u16;
+//                 } else {
+//                     // first u8 in u16
+//                     bits &= 0x00FF;
+//                     bits |= (font_byte as u16) << 8;
+//                 }
+//                 self.buffer[pixel_y + row][word_x] = bits;
+//             }
+//         }
+//     }
 
-    /// Write a string to the text buffer. Wraps off the end of the screen
-    /// automatically.
-    ///
-    /// `x` and `y` are in character cell co-ordinates. `x` is
-    /// `[0..TEXT_MAX_COL]` and `y` is `[0..TEXT_MAX_ROWS]`.
-    ///
-    /// If `flip` is `true`, text will be rendered black on green, otherwise
-    /// the normal green on black.
-    fn write_string(&mut self, message: &str, mut col: usize, mut row: usize, flip: bool) {
-        for ch in message.chars() {
-            self.write_char(ch, col, row, flip);
-            col += 1;
-            if col >= TEXT_NUM_COLS {
-                row += 1;
-                col = 0;
-            }
-            if row >= TEXT_NUM_ROWS {
-                row = 0;
-            }
-        }
-    }
+//     /// Write a string to the text buffer. Wraps off the end of the screen
+//     /// automatically.
+//     ///
+//     /// `x` and `y` are in character cell co-ordinates. `x` is
+//     /// `[0..TEXT_MAX_COL]` and `y` is `[0..TEXT_MAX_ROWS]`.
+//     ///
+//     /// If `flip` is `true`, text will be rendered black on green, otherwise
+//     /// the normal green on black.
+//     fn write_string(&mut self, message: &str, mut col: usize, mut row: usize, flip: bool) {
+//         for ch in message.chars() {
+//             self.write_char(ch, col, row, flip);
+//             col += 1;
+//             if col >= TEXT_NUM_COLS {
+//                 row += 1;
+//                 col = 0;
+//             }
+//             if row >= TEXT_NUM_ROWS {
+//                 row = 0;
+//             }
+//         }
+//     }
 
-    /// Convert a Unicode code-point to a glyph.
-    fn map_char(ch: char) -> Glyph {
-        match ch {
-            ' ' => Glyph::Space,
-            '!' => Glyph::ExclamationMark,
-            '"' => Glyph::DoubleQuote,
-            '#' => Glyph::Hash,
-            '$' => Glyph::Dollar,
-            '%' => Glyph::Percent,
-            '&' => Glyph::Ampersand,
-            '\'' => Glyph::SingleQuote,
-            '(' => Glyph::OpenRoundBracket,
-            ')' => Glyph::CloseRoundBracket,
-            '*' => Glyph::Asterisk,
-            '+' => Glyph::Plus,
-            ',' => Glyph::Comma,
-            '-' => Glyph::Minus,
-            '.' => Glyph::Period,
-            '/' => Glyph::Slash,
-            '0' => Glyph::Digit0,
-            '1' => Glyph::Digit1,
-            '2' => Glyph::Digit2,
-            '3' => Glyph::Digit3,
-            '4' => Glyph::Digit4,
-            '5' => Glyph::Digit5,
-            '6' => Glyph::Digit6,
-            '7' => Glyph::Digit7,
-            '8' => Glyph::Digit8,
-            '9' => Glyph::Digit9,
-            ':' => Glyph::Colon,
-            ';' => Glyph::SemiColon,
-            '<' => Glyph::LessThan,
-            '=' => Glyph::Equals,
-            '>' => Glyph::GreaterThan,
-            '?' => Glyph::QuestionMark,
-            '@' => Glyph::At,
-            'A' => Glyph::UppercaseA,
-            'B' => Glyph::UppercaseB,
-            'C' => Glyph::UppercaseC,
-            'D' => Glyph::UppercaseD,
-            'E' => Glyph::UppercaseE,
-            'F' => Glyph::UppercaseF,
-            'G' => Glyph::UppercaseG,
-            'H' => Glyph::UppercaseH,
-            'I' => Glyph::UppercaseI,
-            'J' => Glyph::UppercaseJ,
-            'K' => Glyph::UppercaseK,
-            'L' => Glyph::UppercaseL,
-            'M' => Glyph::UppercaseM,
-            'N' => Glyph::UppercaseN,
-            'O' => Glyph::UppercaseO,
-            'P' => Glyph::UppercaseP,
-            'Q' => Glyph::UppercaseQ,
-            'R' => Glyph::UppercaseR,
-            'S' => Glyph::UppercaseS,
-            'T' => Glyph::UppercaseT,
-            'U' => Glyph::UppercaseU,
-            'V' => Glyph::UppercaseV,
-            'W' => Glyph::UppercaseW,
-            'X' => Glyph::UppercaseX,
-            'Y' => Glyph::UppercaseY,
-            'Z' => Glyph::UppercaseZ,
-            '[' => Glyph::OpenSquareBracket,
-            '\\' => Glyph::Backslash,
-            ']' => Glyph::CloseSquareBracket,
-            '^' => Glyph::Caret,
-            '_' => Glyph::Underscore,
-            '`' => Glyph::Backtick,
-            'a' => Glyph::LowercaseA,
-            'b' => Glyph::LowercaseB,
-            'c' => Glyph::LowercaseC,
-            'd' => Glyph::LowercaseD,
-            'e' => Glyph::LowercaseE,
-            'f' => Glyph::LowercaseF,
-            'g' => Glyph::LowercaseG,
-            'h' => Glyph::LowercaseH,
-            'i' => Glyph::LowercaseI,
-            'j' => Glyph::LowercaseJ,
-            'k' => Glyph::LowercaseK,
-            'l' => Glyph::LowercaseL,
-            'm' => Glyph::LowercaseM,
-            'n' => Glyph::LowercaseN,
-            'o' => Glyph::LowercaseO,
-            'p' => Glyph::LowercaseP,
-            'q' => Glyph::LowercaseQ,
-            'r' => Glyph::LowercaseR,
-            's' => Glyph::LowercaseS,
-            't' => Glyph::LowercaseT,
-            'u' => Glyph::LowercaseU,
-            'v' => Glyph::LowercaseV,
-            'w' => Glyph::LowercaseW,
-            'x' => Glyph::LowercaseX,
-            'y' => Glyph::LowercaseY,
-            'z' => Glyph::LowercaseZ,
-            '{' => Glyph::OpenBrace,
-            '|' => Glyph::VerticalBar,
-            '}' => Glyph::CloseBrace,
-            '~' => Glyph::Tilde,
-            _ => Glyph::Unknown,
-        }
-    }
+//     /// Convert a Unicode code-point to a glyph.
+//     fn map_char(ch: char) -> Glyph {
+//         match ch {
+//             ' ' => Glyph::Space,
+//             '!' => Glyph::ExclamationMark,
+//             '"' => Glyph::DoubleQuote,
+//             '#' => Glyph::Hash,
+//             '$' => Glyph::Dollar,
+//             '%' => Glyph::Percent,
+//             '&' => Glyph::Ampersand,
+//             '\'' => Glyph::SingleQuote,
+//             '(' => Glyph::OpenRoundBracket,
+//             ')' => Glyph::CloseRoundBracket,
+//             '*' => Glyph::Asterisk,
+//             '+' => Glyph::Plus,
+//             ',' => Glyph::Comma,
+//             '-' => Glyph::Minus,
+//             '.' => Glyph::Period,
+//             '/' => Glyph::Slash,
+//             '0' => Glyph::Digit0,
+//             '1' => Glyph::Digit1,
+//             '2' => Glyph::Digit2,
+//             '3' => Glyph::Digit3,
+//             '4' => Glyph::Digit4,
+//             '5' => Glyph::Digit5,
+//             '6' => Glyph::Digit6,
+//             '7' => Glyph::Digit7,
+//             '8' => Glyph::Digit8,
+//             '9' => Glyph::Digit9,
+//             ':' => Glyph::Colon,
+//             ';' => Glyph::SemiColon,
+//             '<' => Glyph::LessThan,
+//             '=' => Glyph::Equals,
+//             '>' => Glyph::GreaterThan,
+//             '?' => Glyph::QuestionMark,
+//             '@' => Glyph::At,
+//             'A' => Glyph::UppercaseA,
+//             'B' => Glyph::UppercaseB,
+//             'C' => Glyph::UppercaseC,
+//             'D' => Glyph::UppercaseD,
+//             'E' => Glyph::UppercaseE,
+//             'F' => Glyph::UppercaseF,
+//             'G' => Glyph::UppercaseG,
+//             'H' => Glyph::UppercaseH,
+//             'I' => Glyph::UppercaseI,
+//             'J' => Glyph::UppercaseJ,
+//             'K' => Glyph::UppercaseK,
+//             'L' => Glyph::UppercaseL,
+//             'M' => Glyph::UppercaseM,
+//             'N' => Glyph::UppercaseN,
+//             'O' => Glyph::UppercaseO,
+//             'P' => Glyph::UppercaseP,
+//             'Q' => Glyph::UppercaseQ,
+//             'R' => Glyph::UppercaseR,
+//             'S' => Glyph::UppercaseS,
+//             'T' => Glyph::UppercaseT,
+//             'U' => Glyph::UppercaseU,
+//             'V' => Glyph::UppercaseV,
+//             'W' => Glyph::UppercaseW,
+//             'X' => Glyph::UppercaseX,
+//             'Y' => Glyph::UppercaseY,
+//             'Z' => Glyph::UppercaseZ,
+//             '[' => Glyph::OpenSquareBracket,
+//             '\\' => Glyph::Backslash,
+//             ']' => Glyph::CloseSquareBracket,
+//             '^' => Glyph::Caret,
+//             '_' => Glyph::Underscore,
+//             '`' => Glyph::Backtick,
+//             'a' => Glyph::LowercaseA,
+//             'b' => Glyph::LowercaseB,
+//             'c' => Glyph::LowercaseC,
+//             'd' => Glyph::LowercaseD,
+//             'e' => Glyph::LowercaseE,
+//             'f' => Glyph::LowercaseF,
+//             'g' => Glyph::LowercaseG,
+//             'h' => Glyph::LowercaseH,
+//             'i' => Glyph::LowercaseI,
+//             'j' => Glyph::LowercaseJ,
+//             'k' => Glyph::LowercaseK,
+//             'l' => Glyph::LowercaseL,
+//             'm' => Glyph::LowercaseM,
+//             'n' => Glyph::LowercaseN,
+//             'o' => Glyph::LowercaseO,
+//             'p' => Glyph::LowercaseP,
+//             'q' => Glyph::LowercaseQ,
+//             'r' => Glyph::LowercaseR,
+//             's' => Glyph::LowercaseS,
+//             't' => Glyph::LowercaseT,
+//             'u' => Glyph::LowercaseU,
+//             'v' => Glyph::LowercaseV,
+//             'w' => Glyph::LowercaseW,
+//             'x' => Glyph::LowercaseX,
+//             'y' => Glyph::LowercaseY,
+//             'z' => Glyph::LowercaseZ,
+//             '{' => Glyph::OpenBrace,
+//             '|' => Glyph::VerticalBar,
+//             '}' => Glyph::CloseBrace,
+//             '~' => Glyph::Tilde,
+//             _ => Glyph::Unknown,
+//         }
+//     }
 
-    /// Convert the glyph enum to the bits needed for a given line of that glyph.
-    fn font_lookup(glyph: Glyph, row: usize) -> u8 {
-        let index = ((glyph as usize) * FONT_HEIGHT) + row;
-        FONT_DATA[index]
-    }
+//     /// Convert the glyph enum to the bits needed for a given line of that glyph.
+//     fn font_lookup(glyph: Glyph, row: usize) -> u8 {
+//         let index = ((glyph as usize) * FONT_HEIGHT) + row;
+//         FONT_DATA[index]
+//     }
 
-    /// Plot a point on screen.
-    fn draw_point(&mut self, pos: Point, set: bool) {
-        if pos.0 < VISIBLE_COLS && pos.1 < VISIBLE_LINES {
-            unsafe {
-                self.point(pos.0, pos.1, set);
-            }
-        }
-    }
+//     /// Plot a point on screen.
+//     fn draw_point(&mut self, pos: Point, set: bool) {
+//         if pos.0 < VISIBLE_COLS && pos.1 < VISIBLE_LINES {
+//             unsafe {
+//                 self.point(pos.0, pos.1, set);
+//             }
+//         }
+//     }
 
-    unsafe fn point(&mut self, x: usize, y: usize, set: bool) {
-        let word_x = x / 16;
-        let word_x_offset = 15 - (x % 16);
-        if set {
-            self.buffer[y][word_x] |= 1 << word_x_offset;
-        } else {
-            self.buffer[y][word_x] &= !(1 << word_x_offset);
-        }
-    }
+//     unsafe fn point(&mut self, x: usize, y: usize, set: bool) {
+//         let word_x = x / 16;
+//         let word_x_offset = 15 - (x % 16);
+//         if set {
+//             self.buffer[y][word_x] |= 1 << word_x_offset;
+//         } else {
+//             self.buffer[y][word_x] &= !(1 << word_x_offset);
+//         }
+//     }
 
-    /// Draw a box using lines. The box is hollow, not filled.
-    fn hollow_rectangle(&mut self, top_left: Point, bottom_right: Point, set: bool) {
-        let top_right = Point(bottom_right.0, top_left.1);
-        let bottom_left = Point(top_left.0, bottom_right.1);
-        self.line(top_left, top_right, set);
-        self.line(top_right, bottom_right, set);
-        self.line(bottom_right, bottom_left, set);
-        self.line(bottom_left, top_left, set);
-    }
+//     /// Draw a box using lines. The box is hollow, not filled.
+//     fn hollow_rectangle(&mut self, top_left: Point, bottom_right: Point, set: bool) {
+//         let top_right = Point(bottom_right.0, top_left.1);
+//         let bottom_left = Point(top_left.0, bottom_right.1);
+//         self.line(top_left, top_right, set);
+//         self.line(top_right, bottom_right, set);
+//         self.line(bottom_right, bottom_left, set);
+//         self.line(bottom_left, top_left, set);
+//     }
 
-    /// Draw a line.
-    fn line(&mut self, mut start: Point, mut end: Point, set: bool) {
-        start.0 = start.0.min(MAX_X);
-        start.1 = start.1.min(MAX_Y);
-        end.0 = end.0.min(MAX_X);
-        end.1 = end.1.min(MAX_Y);
-        for (x, y) in bresenham::Bresenham::new(
-            (start.0 as isize, start.1 as isize),
-            (end.0 as isize, end.1 as isize),
-        ) {
-            unsafe { self.point(x as usize, y as usize, set) }
-        }
-    }
+//     /// Draw a line.
+//     fn line(&mut self, mut start: Point, mut end: Point, set: bool) {
+//         start.0 = start.0.min(MAX_X);
+//         start.1 = start.1.min(MAX_Y);
+//         end.0 = end.0.min(MAX_X);
+//         end.1 = end.1.min(MAX_Y);
+//         for (x, y) in bresenham::Bresenham::new(
+//             (start.0 as isize, start.1 as isize),
+//             (end.0 as isize, end.1 as isize),
+//         ) {
+//             unsafe { self.point(x as usize, y as usize, set) }
+//         }
+//     }
 
-    fn clear(&mut self) {
-        unsafe {
-            core::ptr::write_bytes(self.buffer.as_mut_ptr(), 0x00, VISIBLE_LINES);
-        }
-    }
-}
+//     fn clear(&mut self) {
+//         unsafe {
+//             core::ptr::write_bytes(self.buffer.as_mut_ptr(), 0x00, VISIBLE_LINES);
+//         }
+//     }
+// }
 
-#[derive(Copy, Clone)]
-struct Point(usize, usize);
+// #[derive(Copy, Clone)]
+// struct Point(usize, usize);
 
 fn main() {
     let p = tm4c123x_hal::Peripherals::take().unwrap();
@@ -600,67 +638,10 @@ fn main() {
     // dma.ctlbase
     //     .write(|w| unsafe { w.addr().bits(&mut DMA_CONTROL_TABLE as *mut DmaInfo as u32) });
 
-    let h_timer = p.TIMER0;
-    // Configure Timer0A for h-sync and Timer0B for line trigger
-    h_timer.ctl.modify(|_, w| {
-        w.taen().clear_bit();
-        w.tben().clear_bit();
-        w
-    });
-    h_timer.cfg.modify(|_, w| w.cfg()._16_bit());
-    h_timer.tamr.modify(|_, w| {
-        w.taams().set_bit();
-        w.tacmr().clear_bit();
-        w.tapwmie().set_bit();
-        w.tamr().period();
-        w
-    });
-    h_timer.tbmr.modify(|_, w| {
-        w.tbams().set_bit();
-        w.tbcmr().clear_bit();
-        w.tbmr().period();
-        w.tbpwmie().set_bit();
-        w
-    });
-    h_timer.ctl.modify(|_, w| w.tapwml().clear_bit());
-    h_timer.ctl.modify(|_, w| {
-        // Trigger Timer A capture on rising edge (i.e. line start)
-        w.tapwml().clear_bit();
-        // Trigger Timer B capture on falling edge (i.e. data start)
-        w.tbpwml().set_bit();
-        w
-    });
-    // We're counting down in PWM mode, so start at the end
-    h_timer
-        .tailr
-        .modify(|_, w| unsafe { w.bits(H_WHOLE_LINE - 1) });
-    h_timer
-        .tbilr
-        .modify(|_, w| unsafe { w.bits(H_WHOLE_LINE - 1) });
-    h_timer
-        .tamatchr
-        .modify(|_, w| unsafe { w.bits(H_SYNC_END - 1) });
-    h_timer
-        .tbmatchr
-        .modify(|_, w| unsafe { w.bits(H_LINE_START - 1) });
-    h_timer.imr.modify(|_, w| {
-        w.caeim().set_bit(); // Timer0A fires at start of line
-        w.cbeim().set_bit(); // Timer0B fires at start of data
-        w
-    });
-
-    // Clear interrupts
-    h_timer.icr.write(|w| {
-        w.tbmcint().set_bit();
-        w.tbtocint().set_bit();
-        w
-    });
-
-    h_timer.ctl.modify(|_, w| {
-        w.taen().set_bit();
-        w.tben().set_bit();
-        w
-    });
+    unsafe {
+        HARDWARE.h_timer = Some(p.TIMER0);
+        FRAMEBUFFER.init(&mut HARDWARE);
+    }
 
     let mut d = Delay::new(cp.SYST, &clocks);
     let mut i = 0;
@@ -673,38 +654,56 @@ fn main() {
     unsafe {
         FRAMEBUFFER.clear();
         for row in 0..TEXT_NUM_ROWS {
-            FRAMEBUFFER.write_char('$', 0, row, true);
-            FRAMEBUFFER.write_char('$', TEXT_MAX_COL, row, true);
+            // FRAMEBUFFER.write_char('$', 0, row, true);
+            // FRAMEBUFFER.write_char('$', TEXT_MAX_COL, row, true);
         }
-        FRAMEBUFFER.line(Point(0, 0), Point(MAX_X, MAX_Y), true);
-        FRAMEBUFFER.hollow_rectangle(Point(50, 50), Point(350, 250), true);
+        FRAMEBUFFER.line(vga_framebuffer::Point(0, 0), vga_framebuffer::Point(vga_framebuffer::MAX_X, vga_framebuffer::MAX_Y), true);
+        FRAMEBUFFER.hollow_rectangle(vga_framebuffer::Point(50, 50), vga_framebuffer::Point(350, 250), true);
     }
 
     writeln!(c, "Hello, Twitters.\nNow we have a font renderer too!").unwrap();
     writeln!(c, "\n-- @therealjpster").unwrap();
-    writeln!(c, "Chip ID: {:?}", chip_id::get()).unwrap();
+    // writeln!(c, "Chip ID: {:?}", chip_id::get()).unwrap();
     writeln!(c, "X\tY").unwrap();
     writeln!(c, "ABC\t123").unwrap();
     writeln!(c, "DEF\t£4.0").unwrap();
     let mut old = 0;
+
+    let mut porta = p.GPIO_PORTA.split(&sc.power_control);
+
+    // Activate UART
+    let uart = Serial::uart0(
+        p.UART0,
+        porta.pa1.into_af1(&mut porta.control),
+        porta.pa0.into_af1(&mut porta.control),
+        (),
+        (),
+        115200_u32.bps(),
+        NewlineMode::SwapLFtoCRLF,
+        &clocks,
+        &sc.power_control,
+    );
+    let (mut tx, mut rx) = uart.split();
+
+    let mut buffer = [0u8; 64];
+    let mut r = Runner::new(&ROOT_MENU, &mut buffer, &mut c);
+
     loop {
-        asm::wfi();
-        let new = unsafe { FRAMEBUFFER.frame };
-        if new != old {
-            old = new;
-            write!(c, "\rLoop {}", i).unwrap();
-            i = i + 1;
+        // Wait for char
+        if let Ok(ch) = rx.read() {
+            // Feed char to runner
+            r.input_byte(ch);
         }
     }
 }
 
-impl<'a> Cursor<'a> {
-    fn new(fb: &'a mut FrameBuffer) -> Cursor<'a> {
+impl<'a, T> Cursor<'a, T> where T: vga_framebuffer::Hardware {
+    fn new(fb: &'a mut vga_framebuffer::FrameBuffer<T>) -> Cursor<'a, T> {
         Cursor { col: 0, row: 0, fb }
     }
 }
 
-impl<'a> core::fmt::Write for Cursor<'a> {
+impl<'a, T> core::fmt::Write for Cursor<'a, T> where T: vga_framebuffer::Hardware {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for ch in s.chars() {
             match ch {
@@ -720,7 +719,7 @@ impl<'a> core::fmt::Write for Cursor<'a> {
                     self.col = (tabs + 1) * 9;
                 }
                 ch => {
-                    self.fb.write_char(ch, self.col, self.row, false);
+                    // self.fb.write_char(ch, self.col, self.row, false);
                     self.col += 1;
                 }
             }
@@ -731,50 +730,117 @@ impl<'a> core::fmt::Write for Cursor<'a> {
             if self.row == TEXT_NUM_ROWS {
                 // Should really scroll screen here...
                 self.row = TEXT_NUM_ROWS - 1;
-                for line in 0..VISIBLE_LINES - FONT_HEIGHT {
-                    self.fb.buffer[line] = self.fb.buffer[line + FONT_HEIGHT];
-                }
-                for line in VISIBLE_LINES - FONT_HEIGHT..VISIBLE_LINES {
-                    self.fb.buffer[line] = [0u16; HORIZONTAL_WORDS];
-                }
+                // for line in 0..vga_framebuffer::VISIBLE_LINES - FONT_HEIGHT {
+                //     self.fb.buffer[line] = self.fb.buffer[line + FONT_HEIGHT];
+                // }
+                // for line in vga_framebuffer::VISIBLE_LINES - FONT_HEIGHT..vga_framebuffer::VISIBLE_LINES {
+                //     self.fb.buffer[line] = [0u16; vga_framebuffer::HORIZONTAL_WORDS];
+                // }
             }
         }
         Ok(())
     }
 }
 
-fn start_of_line(fb_info: &mut FrameBuffer) {
-    let gpio = unsafe { &*tm4c123x_hal::tm4c123x::GPIO_PORTC::ptr() };
+// fn start_of_line(fb_info: &mut FrameBuffer) {
+//     let gpio = unsafe { &*tm4c123x_hal::tm4c123x::GPIO_PORTC::ptr() };
+//     FRAMEBUFFER.isr_sync();
+// }
 
-    fb_info.line_no += 1;
+// fn start_of_data(fb_info: &FrameBuffer) {
+//     let ssi = unsafe { &*tm4c123x_hal::tm4c123x::SSI2::ptr() };
+//     if let Some(line) = fb_info.fb_line {
+//         for word in fb_info.buffer[line].iter() {
+//             ssi.dr.write(|w| unsafe { w.data().bits(*word) });
+//             while ssi.sr.read().tnf().bit_is_clear() {
+//                 asm::nop();
+//             }
+//         }
+//     }
+// }
 
-    if fb_info.line_no == V_WHOLE_FRAME {
-        fb_info.line_no = 0;
+
+impl vga_framebuffer::Hardware for &'static mut Hardware {
+    fn configure(&mut self, width: u32, sync_end: u32, line_start: u32, _clock_rate: u32) {
+        if let Some(ref h_timer) = self.h_timer {
+            // Configure Timer0A for h-sync and Timer0B for line trigger
+            h_timer.ctl.modify(|_, w| {
+                w.taen().clear_bit();
+                w.tben().clear_bit();
+                w
+            });
+            h_timer.cfg.modify(|_, w| w.cfg()._16_bit());
+            h_timer.tamr.modify(|_, w| {
+                w.taams().set_bit();
+                w.tacmr().clear_bit();
+                w.tapwmie().set_bit();
+                w.tamr().period();
+                w
+            });
+            h_timer.tbmr.modify(|_, w| {
+                w.tbams().set_bit();
+                w.tbcmr().clear_bit();
+                w.tbmr().period();
+                w.tbpwmie().set_bit();
+                w
+            });
+            h_timer.ctl.modify(|_, w| {
+                // Trigger Timer A capture on rising edge (i.e. line start)
+                w.tapwml().clear_bit();
+                // Trigger Timer B capture on falling edge (i.e. data start)
+                w.tbpwml().set_bit();
+                w
+            });
+            // We're counting down in PWM mode, so start at the end
+            h_timer
+                .tailr
+                .modify(|_, w| unsafe { w.bits(width * 2 - 1) });
+            h_timer
+                .tbilr
+                .modify(|_, w| unsafe { w.bits(width * 2 - 1) });
+            h_timer
+                .tamatchr
+                .modify(|_, w| unsafe { w.bits(2*(width - sync_end) - 1) });
+            h_timer
+                .tbmatchr
+                    .modify(|_, w| unsafe { w.bits(2*(width - line_start) - 1) });
+            h_timer.imr.modify(|_, w| {
+                w.caeim().set_bit(); // Timer0A fires at start of line
+                w.cbeim().set_bit(); // Timer0B fires at start of data
+                w
+            });
+
+            // Clear interrupts
+            h_timer.icr.write(|w| {
+                w.tbmcint().set_bit();
+                w.tbtocint().set_bit();
+                w
+            });
+
+            h_timer.ctl.modify(|_, w| {
+                w.taen().set_bit();
+                w.tben().set_bit();
+                w
+            });
+        }
+    }
+
+    /// Called when V-Sync needs to be high.
+    fn vsync_on(&mut self) {
+        let gpio = unsafe { &*tm4c123x_hal::tm4c123x::GPIO_PORTC::ptr() };
         unsafe { bb::change_bit(&gpio.data, 4, true) };
     }
 
-    if fb_info.line_no == V_SYNC_PULSE {
+    /// Called when V-Sync needs to be low.
+    fn vsync_off(&mut self) {
+        let gpio = unsafe { &*tm4c123x_hal::tm4c123x::GPIO_PORTC::ptr() };
         unsafe { bb::change_bit(&gpio.data, 4, false) };
     }
 
-    if (fb_info.line_no >= V_SYNC_PULSE + V_BACK_PORCH)
-        && (fb_info.line_no < V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA)
-    {
-        // Visible lines
-        // 600 visible lines, 300 output lines each shown twice
-        fb_info.fb_line = Some((fb_info.line_no - (V_SYNC_PULSE + V_BACK_PORCH)) >> 1);
-    } else if fb_info.line_no == V_SYNC_PULSE + V_BACK_PORCH + V_VISIBLE_AREA {
-        fb_info.frame = fb_info.frame.wrapping_add(1);
-    } else {
-        // Front porch
-        fb_info.fb_line = None;
-    }
-}
-
-fn start_of_data(fb_info: &FrameBuffer) {
-    let ssi = unsafe { &*tm4c123x_hal::tm4c123x::SSI2::ptr() };
-    if let Some(line) = fb_info.fb_line {
-        for word in fb_info.buffer[line].iter() {
+    /// Called when pixels need to be written to the output pin.
+    fn write_pixels(&mut self, pixels: &vga_framebuffer::VideoLine) {
+        let ssi = unsafe { &*tm4c123x_hal::tm4c123x::SSI2::ptr() };
+        for word in &pixels.words {
             ssi.dr.write(|w| unsafe { w.data().bits(*word) });
             while ssi.sr.read().tnf().bit_is_clear() {
                 asm::nop();
@@ -785,17 +851,13 @@ fn start_of_data(fb_info: &FrameBuffer) {
 
 extern "C" fn timer0a_isr() {
     let timer = unsafe { &*tm4c123x_hal::tm4c123x::TIMER0::ptr() };
-    // let cs = unsafe { CriticalSection::new() };
-    let mut fb_info = unsafe { &mut FRAMEBUFFER };
-    start_of_line(&mut fb_info);
+    unsafe { FRAMEBUFFER.isr_sol() };
     timer.icr.write(|w| w.caecint().set_bit());
 }
 
 extern "C" fn timer0b_isr() {
     let timer = unsafe { &*tm4c123x_hal::tm4c123x::TIMER0::ptr() };
-    // let cs = unsafe { CriticalSection::new() };
-    let fb_info = unsafe { &mut FRAMEBUFFER };
-    start_of_data(&fb_info);
+    unsafe { FRAMEBUFFER.isr_data() };
     timer.icr.write(|w| w.cbecint().set_bit());
 }
 
