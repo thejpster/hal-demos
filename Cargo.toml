@@ -33,8 +33,10 @@ panic = "abort"
 [dependencies]
 tm4c123x-hal = { path = "../tm4c123x-hal" }
 bresenham = "0.1.1"
-menu = { path = "../menu" }
-vga-framebuffer = { path = "../vga-framebuffer-rs" }
+# menu = { path = "../menu" }
+menu = { git = "https://github.com/thejpster/menu" }
+# vga-framebuffer = { path = "../vga-framebuffer-rs" }
+vga-framebuffer = { git = "https://github.com/thejpster/vga-framebuffer-rs" }
 
 [dependencies.embedded-hal]
 version = "0.1.1"
